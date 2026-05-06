@@ -50,7 +50,7 @@ class PersonReidentifier:
             id_generator (callable): 全局唯一的ID生成函数，返回下一个可用的临时ID
         """
         print("[ReID] 初始化系统...")
-        model_path = resolve_model_path('weights/transformer_120.om', model_path)
+        model_path = resolve_model_path('weights/transformer_120_16.om', model_path)
         self.identity_folder = identity_folder
         if known_similarity_threshold is None:
             known_similarity_threshold = similarity_threshold

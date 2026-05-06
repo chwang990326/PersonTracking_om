@@ -33,7 +33,7 @@ from models.ascend_yolo import create_yolo_model
 DETECTOR_ONNX_PATH = resolve_model_path('weights/yolo26x.om', 'weights/yolo26x.onnx')
 POSE_ONNX_PATH = resolve_model_path('weights/yolo26s-pose.om', 'weights/yolo26s-pose.onnx')
 PHONE_DETECTOR_ONNX_PATH = resolve_model_path('weights/yolo26x.om', 'weights/yolo26x.onnx')
-REID_MODEL_PATH = resolve_model_path('weights/transformer_120.om', './config/transformer_120.pth')
+REID_MODEL_PATH = resolve_model_path('weights/transformer_120_16.om', './config/transformer_120.pth')
 ACTION_MODEL_PATH = resolve_model_path('weights/best094nophone.om', 'weights/best094nophone.pt')
 CELL_PHONE_CLASS_ID = 67
 
