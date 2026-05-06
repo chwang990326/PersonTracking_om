@@ -1,0 +1,18 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# ByteTrack tracker defaults for mode="track"
+# Docs: https://docs.ultralytics.com/modes/track/
+
+tracker_type: bytetrack # (str) Tracker backend: botsort|bytetrack; choose bytetrack for the classic baseline
+track_high_thresh: 0.25 # (float) First-stage match threshold; raise for cleaner tracks, lower to keep more, default 0.25
+track_low_thresh: 0.1 # (float) Second-stage threshold for low-score matches; balances recovery vs drift, default 0.1
+new_track_thresh: 0.25 # (float) Start a new track if no match ≥ this; higher reduces false tracks, default 0.25
+track_buffer: 30 # (int) Frames to keep lost tracks alive; higher handles occlusion, increases ID switches risk, default 30
+match_thresh: 0.8 # (float) Association similarity threshold (IoU/cost); tune with detector quality, default 0.8
+fuse_score: True # (bool) Fuse detection score with motion/IoU for matching; stabilizes weak detections
+
+# ReID model related thresh
+proximity_thresh: 0.3 # (float) Min IoU to consider tracks proximate for ReID; higher is stricter, default 0.5
+appearance_thresh: 0.4 # (float) Min appearance similarity for ReID; raise to avoid identity swaps, default 0.8
+with_reid: true # (bool) Enable ReID model use; needs extra model and compute
+model: auto # (str) ReID model name/path; "auto" uses detector features if available

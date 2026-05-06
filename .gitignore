@@ -1,0 +1,53 @@
+# 忽略所有图片
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# 忽略所有视频
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# 忽略所有模型权重
+*.pth
+*.pt
+*.h5
+*.weights
+*.onnx
+*.ckpt
+*.om
+
+
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略所有压缩包
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+
+# --- Operating System ---
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+
+# --- Python Virtual Environments ---
+venv/
+.venv/
+env/
+.env
+*.env
+
+# --- Project Output & Logs ---
+results/
+*.log

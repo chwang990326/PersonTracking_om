@@ -1,0 +1,68 @@
+# 姿态-关键点-高度映射规则 (单位: mm)
+# 约定: z = -离地高度。例如，离地1700mm记为-1700。
+# 列表顺序 = 优先级顺序。
+posture_height_mapping:
+  Standing:
+    # 站姿时，最优先使用脚部(z=0)作为地面参考点。
+    - type: foot
+      z: 0
+      indices: [15, 16]
+    # 如果脚部不可见，则回退到使用头部。
+    - type: head
+      z: -1700
+      indices: [0, 1, 2, 3, 4]
+    # 如果头部也不可见，则使用肩膀。
+    - type: shoulder
+      z: -1500
+      indices: [5, 6]
+  Sitting:
+    # 坐姿时，最优先使用臀部作为核心参考点。
+    - type: hip
+      z: -450
+      indices: [11, 12]
+    # 如果臀部不可见，则回退到使用头部。
+    - type: head
+      z: -1200
+      indices: [0, 1, 2, 3, 4]
+    # 如果头部也不可见，则使用脚部。
+    - type: foot
+      z: 0
+      indices: [15, 16]
+  Squatting:
+    # 蹲姿时，最优先使用脚部作为地面参考点。
+    - type: foot
+      z: 0
+      indices: [15, 16]
+    # 如果脚部不可见，则回退到使用臀部。
+    - type: hip
+      z: -350
+      indices: [11, 12]
+    # 如果臀部也不可见，则使用膝盖。
+    - type: knee
+      z: -300
+      indices: [13, 14]
+  Lying Down:
+    # 躺姿时，最优先使用臀部作为身体中心参考点。
+    - type: hip
+      z: -100
+      indices: [11, 12]
+    # 如果臀部不可见，则使用肩膀。
+    - type: shoulder
+      z: -150
+      indices: [5, 6]
+  Bending:
+    # 弯腰时，臀部通常是最高点，但脚部是地面参考点，优先使用脚部。
+    - type: foot
+      z: 0
+      indices: [15, 16]
+    - type: hip
+      z: -800
+      indices: [11, 12]
+    - type: head
+      z: -700
+      indices: [0, 1, 2, 3, 4]
+  Unknown:
+    # 姿态未知时，最稳妥的猜测是脚部在地面上。
+    - type: foot
+      z: 0
+      indices: [15, 16]
