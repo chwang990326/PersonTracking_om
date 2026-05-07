@@ -439,7 +439,7 @@ class VisionAnalysisService:
                     'reidentifier': PersonReidentifier(
                         identity_folder=self.identity_folder,
                         known_similarity_threshold=0.9,
-                        unknown_similarity_threshold=0.9,
+                        unknown_similarity_threshold=0.95,
                         pose_estimator=self.pose_estimator,
                         feature_extractor=self.shared_reid_extractor, # [修改] 传入共享模型
                         id_generator=self._generate_next_global_id,   # [新增] 传入全局
