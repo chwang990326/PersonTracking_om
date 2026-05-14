@@ -15,7 +15,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY . /app
 
 RUN pip3 install --no-cache-dir wheel setuptools --break-system-packages && \
-    pip3 install --no-cache-dir /app/third_party/aclruntime-0.0.2-cp310-cp310-linux_aarch64.whl --break-system-packages && \
+    pip3 install --no-cache-dir /app/third_party/aclruntime-0.0.2-cp311-cp311-linux_aarch64.whl --break-system-packages && \
     pip3 install --no-cache-dir /app/third_party/ais_bench-0.0.2-py3-none-any.whl --break-system-packages
 
 RUN echo "/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64" >> /etc/ld.so.conf.d/ascend.conf && \
