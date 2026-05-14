@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import time
 from datetime import datetime
 
@@ -50,6 +51,11 @@ def parse_args():
         type=int,
         default=0,
         help="Stop after sending this many frames, 0 means no limit",
+    )
+    parser.add_argument(
+        "--trust-env-proxy",
+        action="store_true",
+        help="Honor HTTP_PROXY/HTTPS_PROXY from the environment",
     )
     parser.add_argument(
         "--enable-face-recognition",
@@ -148,6 +154,8 @@ def summarize_result(result):
 
 def main():
     args = parse_args()
+    session = requests.Session()
+    session.trust_env = args.trust_env_proxy
 
     cap = cv2.VideoCapture(args.video_path)
     if not cap.isOpened():
@@ -158,6 +166,9 @@ def main():
     print(f"camera_id={args.camera_id}")
     print(f"frame_step={args.frame_step}")
     print(f"encode_format={args.encode_format}")
+    print(f"trust_env_proxy={args.trust_env_proxy}")
+    print(f"http_proxy={os.getenv('HTTP_PROXY') or os.getenv('http_proxy')}")
+    print(f"https_proxy={os.getenv('HTTPS_PROXY') or os.getenv('https_proxy')}")
 
     frame_index = 0
     sent_count = 0
@@ -188,9 +199,15 @@ def main():
 
             try:
                 started_at = time.time()
-                response = requests.post(args.api_url, json=payload, timeout=args.timeout)
+                response = session.post(args.api_url, json=payload, timeout=args.timeout)
                 elapsed_ms = (time.time() - started_at) * 1000.0
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    print(
+                        f"frame={frame_index} sent={sent_count + 1} "
+                        f"status={response.status_code} cost_ms={elapsed_ms:.1f} "
+                        f"body={response.text[:500]}"
+                    )
+                    break
                 result = response.json()
                 summary = summarize_result(result)
                 print(
