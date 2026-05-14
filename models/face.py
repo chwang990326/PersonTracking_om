@@ -222,6 +222,30 @@ class FaceRecognizer:
             print(f"[FaceRecognizer] 检测和识别过程中出错: {e}")
             return [], []
 
+    def verify_person_id(self, image):
+        """
+        Run face verification on a single image.
+
+        Returns:
+            tuple: (person_id, face_detected)
+        """
+        face_boxes, face_ids = self.detect_and_recognize(
+            face_detector=None,
+            frame=image,
+            person_crop=image,
+            crop_x1=0,
+            crop_y1=0,
+        )
+
+        if not face_boxes:
+            return None, False
+
+        for person_id in face_ids:
+            if person_id and person_id != 'Unknown':
+                return str(person_id), True
+
+        return None, True
+
     def reload_gallery(self):
         """重新加载人脸库"""
         self.face_db = FaceDatabase(db_path=self.db_path)

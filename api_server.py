@@ -56,6 +56,20 @@ class BaseResponse(BaseModel):
     data: Optional[DetectResponseData] = None
     timestamp: int
 
+
+class ThirdFaceVerifyRequest(BaseModel):
+    picBase64: str = Field(..., description="face image base64")
+
+
+class ThirdFaceVerifyData(BaseModel):
+    personId: str = Field("", description="matched person ID")
+
+
+class ThirdFaceVerifyResponse(BaseModel):
+    code: str
+    msg: str
+    data: ThirdFaceVerifyData
+
 # --- 2. 初始化 App 和 服务 ---
 app = FastAPI(title="视频人员识别接口服务", version="1.0")
 
@@ -156,6 +170,51 @@ async def face_refresh():
             message="加载失败",
             timestamp=get_current_timestamp()
         )
+
+@app.post("/third/face/verify", response_model=ThirdFaceVerifyResponse)
+async def third_face_verify(request: ThirdFaceVerifyRequest):
+    """
+    Third-party face verification API.
+    """
+    img = base64_to_cv2(request.picBase64)
+    empty_data = ThirdFaceVerifyData(personId="")
+
+    if img is None:
+        return ThirdFaceVerifyResponse(
+            code="1001",
+            msg="invalid image data",
+            data=empty_data,
+        )
+
+    try:
+        person_id, face_detected = service.verify_face_from_image(img)
+        if not face_detected:
+            return ThirdFaceVerifyResponse(
+                code="1201",
+                msg="no face detected",
+                data=empty_data,
+            )
+
+        if not person_id:
+            return ThirdFaceVerifyResponse(
+                code="1202",
+                msg="person not found",
+                data=empty_data,
+            )
+
+        return ThirdFaceVerifyResponse(
+            code="0",
+            msg="success",
+            data=ThirdFaceVerifyData(personId=person_id),
+        )
+    except Exception as e:
+        print(f"Internal Error: {e}")
+        return ThirdFaceVerifyResponse(
+            code="1400",
+            msg=f"internal error: {str(e)}",
+            data=empty_data,
+        )
+
 
 if __name__ == "__main__":
     # 启动服务

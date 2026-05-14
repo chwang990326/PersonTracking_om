@@ -118,8 +118,17 @@ class VisionAnalysisService:
             scrfd_model_path='weights/det_10g.onnx',
             adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
             architecture='ir_50',
-            similarity_threshold=0.5,
-            detection_threshold=0.7,
+            similarity_threshold=0.45,
+            detection_threshold=0.65,
+            db_path='./database/face_database'
+        )
+        self.image_face_recognizer = FaceRecognizer(
+            face_gallery_path='faceImage',
+            scrfd_model_path='weights/det_10g.onnx',
+            adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
+            architecture='ir_50',
+            similarity_threshold=0.35,
+            detection_threshold=0.3,
             db_path='./database/face_database'
         )
         self.shared_unknown_store = UnknownEntityStore(
@@ -853,7 +862,16 @@ class VisionAnalysisService:
                 adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
                 architecture='ir_50',
                 similarity_threshold=0.45,
-                detection_threshold=0.7,
+                detection_threshold=0.65,
+                db_path='./database/face_database'
+            )
+            self.image_face_recognizer = FaceRecognizer(
+                face_gallery_path='faceImage',
+                scrfd_model_path='weights/det_10g.onnx',
+                adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
+                architecture='ir_50',
+                similarity_threshold=0.35,
+                detection_threshold=0.3,
                 db_path='./database/face_database'
             )
             self._refresh_identity_store_if_needed(force=True)
@@ -862,3 +880,15 @@ class VisionAnalysisService:
         except Exception as e:
             print(f"重载失败: {e}")
             return False
+
+    def verify_face_from_image(self, image):
+        """
+        Run face verification on a single image.
+
+        Returns:
+            tuple: (person_id, face_detected)
+        """
+        if image is None or image.size == 0:
+            return None, False
+
+        return self.image_face_recognizer.verify_person_id(image)
