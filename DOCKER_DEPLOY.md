@@ -174,7 +174,36 @@ atc \
 weights/yolo26s-pose.om
 ```
 
-## 4. Dockerfile 建议
+## 4. Python 运行时补充说明
+
+当前项目在华为 NPU 上走 OM 推理时，除了普通 Python 依赖，还需要这两个本地 wheel：
+
+- `ais_bench-0.0.2-py3-none-any.whl`
+- `aclruntime-0.0.2-cp310-cp310-linux_aarch64.whl`
+
+建议把这两个文件放到项目根目录下的固定位置，例如：
+
+```bash
+third_party/
+  ais_bench-0.0.2-py3-none-any.whl
+  aclruntime-0.0.2-cp310-cp310-linux_aarch64.whl
+```
+
+这样 Docker 构建时就不需要再访问 Gitee。
+
+安装顺序建议：
+
+1. 先安装 `aclruntime`
+2. 再安装 `ais_bench`
+
+容器内可用以下命令验证：
+
+```bash
+python -c "import aclruntime; print('aclruntime ok')"
+python -c "from ais_bench.infer.interface import InferSession; print('ais_bench ok')"
+```
+
+## 5. Dockerfile 建议
 
 推荐基于 Ascend 官方 CANN 基础镜像构建。下面是适配当前项目的参考 Dockerfile。
 
@@ -193,11 +222,11 @@ RUN yum install -y zlib-devel git mesa-libGL && yum clean all
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages
 
-RUN pip3 install --no-cache-dir wheel setuptools --break-system-packages && \
-    pip3 install --no-cache-dir git+https://gitee.com/ascend/tools.git#subdirectory=ais-bench_workload/tool/ais_bench/backend --break-system-packages && \
-    pip3 install --no-cache-dir git+https://gitee.com/ascend/tools.git#subdirectory=ais-bench_workload/tool/ais_bench --break-system-packages
-
 COPY . /app
+
+RUN pip3 install --no-cache-dir wheel setuptools --break-system-packages && \
+    pip3 install --no-cache-dir /app/third_party/aclruntime-0.0.2-cp310-cp310-linux_aarch64.whl --break-system-packages && \
+    pip3 install --no-cache-dir /app/third_party/ais_bench-0.0.2-py3-none-any.whl --break-system-packages
 
 RUN echo "/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64" >> /etc/ld.so.conf.d/ascend.conf && \
     echo "/usr/local/Ascend/ascend-toolkit/latest/compiler/lib64" >> /etc/ld.so.conf.d/ascend.conf && \
@@ -214,7 +243,7 @@ ENV ASCEND_DEVICE_ID=0
 CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8130", "--workers", "1"]
 ```
 
-## 5. 构建镜像
+## 6. 构建镜像
 
 在项目根目录执行：
 
@@ -228,7 +257,7 @@ sudo docker build --network host -t person_tracking_om:v1 .
 sudo docker save -o person_tracking_om_v1.tar person_tracking_om:v1
 ```
 
-## 6. 单容器单 worker 运行
+## 7. 单容器单 worker 运行
 
 先从单 worker 跑通，再做并发性能测试。
 
@@ -271,7 +300,7 @@ sudo docker logs -f person_tracking_om_1w
 sudo docker exec -it person_tracking_om_1w bash
 ```
 
-## 7. 多 worker 性能测试建议
+## 8. 多 worker 性能测试建议
 
 ### 7.1 直接开多个 Uvicorn worker
 
@@ -338,7 +367,7 @@ sudo docker run -itd \
 
 如果服务器上有多张卡，推荐把不同容器绑到不同的 `ASCEND_DEVICE_ID`。
 
-## 8. 服务可用性检查
+## 9. 服务可用性检查
 
 ### 8.1 健康检查思路
 
@@ -363,7 +392,7 @@ sudo docker run -itd \
 python test_api.py --max-frames 20
 ```
 
-## 9. 常见问题
+## 10. 常见问题
 
 ### 9.1 看到日志里写 `cpu`，是否说明没有走 NPU
 
@@ -403,7 +432,26 @@ ss -lntp | grep 8130
 - 是否请求到了外层网关而不是本机 `127.0.0.1`
 - 容器内服务是否真的监听在 `8130`
 
-## 10. 建议的落地顺序
+### 10.4 `No module named 'ais_bench'`
+
+说明容器里没有安装 `ais_bench` wheel，或者安装路径不对。
+
+优先检查：
+
+- `third_party/ais_bench-0.0.2-py3-none-any.whl` 是否已被复制进镜像
+- `pip show ais-bench` 或 `pip show ais_bench`
+
+### 10.5 `No module named 'aclruntime'`
+
+说明只安装了 `ais_bench`，但没有安装 `aclruntime`。
+
+优先检查：
+
+- `third_party/aclruntime-0.0.2-cp310-cp310-linux_aarch64.whl` 是否存在
+- Dockerfile 中是否先安装了 `aclruntime` 再安装 `ais_bench`
+- Python 版本是否为 `3.10`
+
+## 11. 建议的落地顺序
 
 1. 先确认所有 `.om` 文件名与代码一致
 2. 用 `workers=1` 跑通容器
@@ -411,7 +459,7 @@ ss -lntp | grep 8130
 4. 记录单 worker 的时延、吞吐、NPU 占用
 5. 再增加 worker 或增加容器实例做压测
 
-## 11. 可选后续工作
+## 12. 可选后续工作
 
 后续如果要把部署流程固定下来，建议继续补齐：
 
