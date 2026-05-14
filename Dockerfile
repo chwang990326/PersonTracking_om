@@ -4,8 +4,8 @@ USER root
 WORKDIR /app
 
 # 需要代理时再打开，默认不要把账号密码硬编码进镜像
-# ENV HTTP_PROXY=http://<proxy-host>:<port>
-# ENV HTTPS_PROXY=http://<proxy-host>:<port>
+ENV HTTP_PROXY="http://wangchenhao:wangchenhao@192.168.100.222:7890"
+ENV HTTPS_PROXY="http://wangchenhao:wangchenhao@192.168.100.222:7890"
 
 RUN yum install -y zlib-devel git mesa-libGL && yum clean all
 
