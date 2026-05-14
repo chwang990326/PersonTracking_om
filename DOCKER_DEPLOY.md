@@ -45,7 +45,7 @@ npu-smi info
 假设项目目录为：
 
 ```bash
-/home/wangchenhao/PersonTracking_om
+/home/wangchenhao/video/PersonTracking_om
 ```
 
 建议至少保证以下目录完整：
@@ -275,7 +275,7 @@ sudo docker run -itd \
   -v /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons \
   -v /usr/slog:/usr/slog \
   -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-  -v /home/wangchenhao/PersonTracking_om:/app \
+  -v /home/wangchenhao/video/PersonTracking_om:/app \
   -p 8130:8130 \
   -e MODEL_BACKEND=om \
   -e ASCEND_DEVICE_ID=0 \
@@ -284,7 +284,7 @@ sudo docker run -itd \
 
 说明：
 
-- `-v /home/wangchenhao/PersonTracking_om:/app` 用于直接挂载代码和模型，便于调试
+- `-v /home/wangchenhao/video/PersonTracking_om:/app` 用于直接挂载代码和模型，便于调试
 - 如果要做纯镜像发布，可以不挂载源码，而是在 `docker build` 时把项目打进镜像
 - 当前端口以 `8130` 为准，因为仓库里的 `api_server.py` 当前默认就是这个端口
 
@@ -343,7 +343,7 @@ sudo docker run -itd \
   --device /dev/devmm_svm \
   --device /dev/hisi_hdc \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-  -v /home/wangchenhao/PersonTracking_om:/app \
+  -v /home/wangchenhao/video/PersonTracking_om:/app \
   -p 8131:8130 \
   -e MODEL_BACKEND=om \
   -e ASCEND_DEVICE_ID=0 \
@@ -358,7 +358,7 @@ sudo docker run -itd \
   --device /dev/devmm_svm \
   --device /dev/hisi_hdc \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-  -v /home/wangchenhao/PersonTracking_om:/app \
+  -v /home/wangchenhao/video/PersonTracking_om:/app \
   -p 8132:8130 \
   -e MODEL_BACKEND=om \
   -e ASCEND_DEVICE_ID=0 \
