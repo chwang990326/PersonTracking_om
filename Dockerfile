@@ -10,7 +10,7 @@ ENV HTTPS_PROXY="http://wangchenhao:wangchenhao@192.168.100.222:7890"
 RUN yum install -y zlib-devel git mesa-libGL && yum clean all
 
 COPY requirements.txt /app/
-RUN pip3 install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . /app
 
