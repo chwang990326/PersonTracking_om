@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument(
         "--enable-uniformer-inference",
         action="store_true",
-        default=True,
+        default=False,
         help="Enable uniformer inference",
     )
     parser.add_argument(
