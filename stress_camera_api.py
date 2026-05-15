@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 
-DEFAULT_API_URL = "http://127.0.0.1:8130/api/v1/person/detect"
+DEFAULT_API_URL = "http://192.168.14.42:8130/api/v1/person/detect"
 DEFAULT_VIDEO_DIR = "video"
 DEFAULT_CAMERA_IDS = "207"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".flv"}
