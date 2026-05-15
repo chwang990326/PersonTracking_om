@@ -29,6 +29,7 @@ from models.reid_state import SharedIdentityStore
 from models.ascend_action import AscendActionModel
 from models.ascend_backend import is_om_path, resolve_model_path
 from models.ascend_yolo import create_yolo_model
+from utils.profiler import RequestProfiler
 
 DETECTOR_ONNX_PATH = resolve_model_path('weights/yolo26x.om', 'weights/yolo26x.onnx')
 POSE_ONNX_PATH = resolve_model_path('weights/yolo26s-pose.om', 'weights/yolo26s-pose.onnx')
@@ -476,7 +477,8 @@ class VisionAnalysisService:
                                  enable_behavior=False,
                                  enable_uniformer=False,
                                  enable_positioning=True,
-                                 enable_tracking=True):
+                                 enable_tracking=True,
+                                 profiler=None):
         """
         处理单张图片的核心方法，包含检测、识别、行为分析等功能。
          - 参数说明：
@@ -487,46 +489,51 @@ class VisionAnalysisService:
             - enable_positioning: 是否启用姿态估计和定位功能。
             - enable_tracking: 是否启用跟踪功能（需要配合 ReID 使用）。
         """
+        if profiler is None:
+            profiler = RequestProfiler()
+
         if not camera_id:
             camera_id = "default"
 
-        self._refresh_identity_store_if_needed()
-        self.shared_unknown_store.cleanup_stale()
-        camera_params = self.get_camera_params(camera_id)
+        with profiler.section("4_State_And_Config"):
+            self._refresh_identity_store_if_needed()
+            self.shared_unknown_store.cleanup_stale()
+            camera_params = self.get_camera_params(camera_id)
 
-        state = self.get_camera_state(camera_id)
-        uniformer_enabled = bool(enable_behavior and enable_uniformer)
-        if state.get('uniformer_enabled', False) != uniformer_enabled:
-            self._reset_uniformer_state(state)
-            state['uniformer_enabled'] = uniformer_enabled
+            state = self.get_camera_state(camera_id)
+            uniformer_enabled = bool(enable_behavior and enable_uniformer)
+            if state.get('uniformer_enabled', False) != uniformer_enabled:
+                self._reset_uniformer_state(state)
+                state['uniformer_enabled'] = uniformer_enabled
 
-        action_model = self._get_action_model() if uniformer_enabled else None
-        detector = state['detector']
-        reidentifier = state['reidentifier']
-        person_video_cache = state['video_cache']
-        person_frame_counter = state['frame_counter']
-        person_action_cache = state['action_cache']
-        action_pred_cache = state['action_pred_cache']
-        face_vote_table = state['face_vote_table']
-        face_last_seen = state['face_last_seen']
-        track_filter_states = state['track_filter_states']
-        current_time_sec = time.time()
+            action_model = self._get_action_model() if uniformer_enabled else None
+            detector = state['detector']
+            reidentifier = state['reidentifier']
+            person_video_cache = state['video_cache']
+            person_frame_counter = state['frame_counter']
+            person_action_cache = state['action_cache']
+            action_pred_cache = state['action_pred_cache']
+            face_vote_table = state['face_vote_table']
+            face_last_seen = state['face_last_seen']
+            track_filter_states = state['track_filter_states']
+            current_time_sec = time.time()
 
         frame = image
         persons_result = []
 
-        if enable_tracking:
-            results = detector.track(
-                frame,
-                verbose=False,
-                classes=[0],
-                conf=0.5,
-                device=self.yolo_device,
-                persist=True,
-                tracker="bytetrack.yaml",
-            )
-        else:
-            results = detector.predict(frame, verbose=False, classes=[0], conf=0.5, device=self.yolo_device)
+        with profiler.section("5_Person_Detection"):
+            if enable_tracking:
+                results = detector.track(
+                    frame,
+                    verbose=False,
+                    classes=[0],
+                    conf=0.5,
+                    device=self.yolo_device,
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                )
+            else:
+                results = detector.predict(frame, verbose=False, classes=[0], conf=0.5, device=self.yolo_device)
 
         boxes = results[0].boxes.xyxy.cpu().numpy()
         has_person = len(boxes) > 0
@@ -558,15 +565,16 @@ class VisionAnalysisService:
                 face_last_seen.pop(stale_track_id, None)
 
         if enable_tracking and has_person:
-            try:
-                reid_ids, reid_confs = reidentifier.identify(frame, boxes, track_ids=current_track_ids)
-                if len(reid_ids) == len(boxes):
-                    assigned_ids = reid_ids
-                    assigned_confs = reid_confs
-                else:
-                    print(f"[Warn] ReID count mismatch ({len(reid_ids)} vs {len(boxes)}). Using raw detections.")
-            except Exception as e:
-                print(f"[Error] ReID identification error: {e}")
+            with profiler.section("6_Person_ReID"):
+                try:
+                    reid_ids, reid_confs = reidentifier.identify(frame, boxes, track_ids=current_track_ids)
+                    if len(reid_ids) == len(boxes):
+                        assigned_ids = reid_ids
+                        assigned_confs = reid_confs
+                    else:
+                        print(f"[Warn] ReID count mismatch ({len(reid_ids)} vs {len(boxes)}). Using raw detections.")
+                except Exception as e:
+                    print(f"[Error] ReID identification error: {e}")
 
         for current_idx, (box, person_id, conf, track_id) in enumerate(zip(boxes, assigned_ids, assigned_confs, current_track_ids)):
             if isinstance(person_id, list):
@@ -585,18 +593,19 @@ class VisionAnalysisService:
             action_label, action_conf = None, 0.0
             id_resource = "ReID"
             if uniformer_enabled and person_id != -1:
-                action_crop = crop_and_pad(frame, box, margin_percent=50)
-                person_video_cache[person_id].append(action_crop)
-                person_frame_counter[person_id] += 1
+                with profiler.section("7_Action_Uniformer"):
+                    action_crop = crop_and_pad(frame, box, margin_percent=50)
+                    person_video_cache[person_id].append(action_crop)
+                    person_frame_counter[person_id] += 1
 
-                if (len(person_video_cache[person_id]) == 16 and 
-                    person_frame_counter[person_id] % self.action_infer_interval == 0):
-                    seq = list(person_video_cache[person_id])
-                    input_tensor = preprocess_crops_for_video_cls(seq).to(self.device)
-                    with torch.no_grad():
-                        outputs = action_model(input_tensor)
-                    pred_labels, pred_confs = postprocess(outputs)
-                    person_action_cache[person_id] = (pred_labels[0], pred_confs[0])
+                    if (len(person_video_cache[person_id]) == 16 and
+                        person_frame_counter[person_id] % self.action_infer_interval == 0):
+                        seq = list(person_video_cache[person_id])
+                        input_tensor = preprocess_crops_for_video_cls(seq).to(self.device)
+                        with torch.no_grad():
+                            outputs = action_model(input_tensor)
+                        pred_labels, pred_confs = postprocess(outputs)
+                        person_action_cache[person_id] = (pred_labels[0], pred_confs[0])
 
             if uniformer_enabled and person_id in person_action_cache:
                 current_pred_label, current_pred_conf = person_action_cache[person_id]
@@ -620,14 +629,15 @@ class VisionAnalysisService:
                 action_pred_cache[person_id] = current_effective_label
 
             if enable_behavior:
-                person_box_crop = frame[
-                    max(0, y1):min(frame.shape[0], y2),
-                    max(0, x1):min(frame.shape[1], x2),
-                ]
-                phone_conf = self._detect_cell_phone_conf(person_box_crop)
-                if phone_conf > self.PHONE_CONFIDENCE_THRESHOLD:
-                    action_label = 'looking_at_phone'
-                    action_conf = phone_conf
+                with profiler.section("8_Phone_Detection"):
+                    person_box_crop = frame[
+                        max(0, y1):min(frame.shape[0], y2),
+                        max(0, x1):min(frame.shape[1], x2),
+                    ]
+                    phone_conf = self._detect_cell_phone_conf(person_box_crop)
+                    if phone_conf > self.PHONE_CONFIDENCE_THRESHOLD:
+                        action_label = 'looking_at_phone'
+                        action_conf = phone_conf
 
             world_coords = None
             detected_kp_count = 0
@@ -637,15 +647,17 @@ class VisionAnalysisService:
             keypoint_type = "box_bottom"
 
             if enable_face or enable_positioning:
-                pose_results = self.pose_estimator(base_crop.copy(), verbose=False, conf=0.7, device=self.yolo_device)
-                if pose_results and len(pose_results[0].keypoints.data) > 0:
-                    kp_data = pose_results[0].keypoints.data[0].cpu().numpy()
-                    detected_kp_count = int(np.sum(kp_data[:, 2] > 0.5))
-                    keypoints_global = kp_data.copy()
-                    keypoints_global[:, 0] += crop_x1
-                    keypoints_global[:, 1] += crop_y1
+                with profiler.section("9_Pose_Estimation"):
+                    pose_results = self.pose_estimator(base_crop.copy(), verbose=False, conf=0.7, device=self.yolo_device)
+                    if pose_results and len(pose_results[0].keypoints.data) > 0:
+                        kp_data = pose_results[0].keypoints.data[0].cpu().numpy()
+                        detected_kp_count = int(np.sum(kp_data[:, 2] > 0.5))
+                        keypoints_global = kp_data.copy()
+                        keypoints_global[:, 0] += crop_x1
+                        keypoints_global[:, 1] += crop_y1
 
             if enable_face:
+                profiler.start("10_Face_Recognition")
                 face_candidates = self._extract_face_candidates(base_crop.copy(), crop_x1, crop_y1)
                 primary_face = face_candidates[0] if face_candidates else None
                 detected_face_id = None
@@ -749,8 +761,10 @@ class VisionAnalysisService:
                                         all_boxes=boxes,
                                         current_idx=current_idx,
                                     )
+                profiler.stop("10_Face_Recognition")
 
             if enable_positioning:
+                profiler.start("11_World_Coord_Calc")
                 if keypoints_global is not None:
                     posture, _ = classify_posture_with_verification(keypoints_global, camera_params, ratio_threshold=0.7)
                     world_coords, keypoint_type, _ = get_world_coords_from_pose(posture, keypoints_global, camera_params)
@@ -803,6 +817,8 @@ class VisionAnalysisService:
             cad_coords = None
             if world_coords is not None:
                 cad_coords = world_to_cad(world_coords, camera_params)
+            if enable_positioning:
+                profiler.stop("11_World_Coord_Calc")
 
             pid_str = str(person_id) if person_id != -1 else None 
             raw_track_id = None

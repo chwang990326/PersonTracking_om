@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 from calibration_module.routers import router as calibration_router
 
 from service import CameraConfigError, VisionAnalysisService
+from utils.profiler import ProfilingStats, RequestProfiler
 
 # --- 1. 定义 Request/Response 模型 (根据文档) ---
 
@@ -78,6 +79,7 @@ app.include_router(calibration_router, tags=["相机标定服务"])
 
 # 全局服务实例 (启动时加载模型)
 service = VisionAnalysisService()
+api_profiler_stats = ProfilingStats("api")
 
 def get_current_timestamp():
     return int(time.time() * 1000)
@@ -102,54 +104,74 @@ app.include_router(calibration_router, tags=["相机标定服务"])
 
 @app.post("/api/v1/person/detect", response_model=BaseResponse)
 async def person_detect(request: PersonDetectRequest):
+    profiler = RequestProfiler()
+    profiler.start("0_Request_Total")
     """
     3.2 人员检测接口
     """
     # 1. Base64 解码
-    img = base64_to_cv2(request.image)
+    with profiler.section("1_Base64_JPEG_Decode"):
+        img = base64_to_cv2(request.image)
     if img is None:
-        return BaseResponse(
+        response = BaseResponse(
             code=1001,
             message="图片数据格式错误",
             timestamp=get_current_timestamp()
-        )
+            )
+        profiler.stop("0_Request_Total")
+        api_profiler_stats.record(profiler)
+        return response
 
     try:
         # 2. 调用业务层逻辑
         # [修改] 正确解包返回的元组 (注意 service.py 返回顺序是 exist_person, persons)
-        exist_person, persons = service.detect_person_from_image(
-            img, 
-            camera_id=request.camera_id,
-            enable_face=request.enable_face_recognition,
-            enable_behavior=request.enable_behavior_detection,
-            enable_uniformer=request.enable_uniformer_inference,
-            enable_positioning=request.enable_spatial_positioning,
-            enable_tracking=request.enable_target_tracking
-        )
+        with profiler.section("2_Service_Detect"):
+            service_profiler = RequestProfiler()
+            exist_person, persons = service.detect_person_from_image(
+                img,
+                camera_id=request.camera_id,
+                enable_face=request.enable_face_recognition,
+                enable_behavior=request.enable_behavior_detection,
+                enable_uniformer=request.enable_uniformer_inference,
+                enable_positioning=request.enable_spatial_positioning,
+                enable_tracking=request.enable_target_tracking,
+                profiler=service_profiler,
+            )
+        profiler.merge(service_profiler)
         
         # 3. 构造成功响应
-        return BaseResponse(
-            code=0,
+        with profiler.section("3_Response_Build"):
+            response = BaseResponse(
+                code=0,
             message="操作成功",
             # [修改] 将两个参数分别传入
             data=DetectResponseData(exist_person=exist_person, persons=persons),
             timestamp=get_current_timestamp()
         )
-        
+        profiler.stop("0_Request_Total")
+        api_profiler_stats.record(profiler)
+        return response
+
     except CameraConfigError as e:
-        return BaseResponse(
+        response = BaseResponse(
             code=1202,
             message=str(e),
             timestamp=get_current_timestamp()
         )
+        profiler.stop("0_Request_Total")
+        api_profiler_stats.record(profiler)
+        return response
     except Exception as e:
         # 捕获未知异常
         print(f"Internal Error: {e}")
-        return BaseResponse(
+        response = BaseResponse(
             code=1400,
             message=f"系统内部错误: {str(e)}",
             timestamp=get_current_timestamp()
         )
+        profiler.stop("0_Request_Total")
+        api_profiler_stats.record(profiler)
+        return response
 
 @app.get("/api/v1/face/refresh", response_model=BaseResponse)
 async def face_refresh():
