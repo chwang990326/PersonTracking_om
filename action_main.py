@@ -10,8 +10,7 @@ from service import CameraConfigError, VisionAnalysisService
 
 CAMERA_ID = "203"
 VIDEO_IN_PATH = (
-    "D:/program/tdh/data/评测集/04091452/"
-    "NVR_ch2_main_20260409145200_20260409151600.mp4"
+    "./video/w1.mp4"
 )
 VIDEO_OUT_PATH = "results/output_203_long.mp4"
 JSON_OUT_PATH = "results/location_203.json"
