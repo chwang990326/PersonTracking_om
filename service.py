@@ -119,8 +119,8 @@ class VisionAnalysisService:
             scrfd_model_path='weights/det_10g.onnx',
             adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
             architecture='ir_50',
-            similarity_threshold=0.45,
-            detection_threshold=0.65,
+            similarity_threshold=0.5,
+            detection_threshold=0.7,
             db_path='./database/face_database'
         )
         self.image_face_recognizer = FaceRecognizer(
