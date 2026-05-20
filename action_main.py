@@ -10,7 +10,7 @@ from service import CameraConfigError, VisionAnalysisService
 
 CAMERA_ID = "203"
 VIDEO_IN_PATH = (
-    "./video/w1.mp4"
+    "./video/test.mp4"
 )
 VIDEO_OUT_PATH = "results/output_203_long.mp4"
 JSON_OUT_PATH = "results/location_203.json"
@@ -18,7 +18,7 @@ JSON_OUT_PATH = "results/location_203.json"
 PROCESS_TARGET_FPS = 5.0
 ENABLE_FACE_RECOGNITION = True
 ENABLE_BEHAVIOR_DETECTION = True
-ENABLE_UNIFORMER_INFERENCE = True
+ENABLE_UNIFORMER_INFERENCE = False
 ENABLE_SPATIAL_POSITIONING = True
 ENABLE_TARGET_TRACKING = True
 
