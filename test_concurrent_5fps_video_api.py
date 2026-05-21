@@ -1,9 +1,11 @@
 """
-Concurrent 5 FPS video client for /api/v1/person/detect.
+Paced 5 FPS video client for /api/v1/person/detect.
 
-The script samples video frames at 5 FPS, sends each one-second batch
-concurrently to the API, saves full responses under results/, and writes
-an annotated MP4 similar to action_main.py.
+The script samples video frames at 5 FPS and submits one request every
+0.2 seconds in frame order. It does not wait for the previous response
+before sending the next frame, so multiple requests can be in flight.
+Full responses are saved under results/, and an annotated MP4 is written
+similar to action_main.py.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import math
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,7 @@ DEFAULT_VIDEO_PATH = "video/test1.mp4"
 DEFAULT_API_URL = "http://192.168.100.64:8130/api/v1/person/detect"
 DEFAULT_CAMERA_ID = "207"
 DEFAULT_TARGET_FPS = 5.0
+DEFAULT_MAX_WORKERS = 32
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_OUTPUT_DIR = "results"
 DEFAULT_ENCODE_FORMAT = ".jpg"
@@ -43,12 +46,17 @@ class SampledFrame:
     frame_index: int
     source_time_sec: float
     batch_second: int
+    scheduled_send_time_sec: float
+    client_submit_offset_sec: Optional[float]
     frame: Any
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Send video/test1.mp4 frames concurrently at 5 FPS to the person detect API."
+        description=(
+            "Send video/test1.mp4 frames to the person detect API at a fixed "
+            "5 FPS cadence without waiting for previous responses."
+        )
     )
     parser.add_argument("--video-path", default=DEFAULT_VIDEO_PATH, help="Input video path")
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Person detect API URL")
@@ -57,8 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=5,
-        help="Max concurrent requests per batch. Use 5 for one-second 5 FPS batches.",
+        default=DEFAULT_MAX_WORKERS,
+        help="Maximum in-flight request workers. Keep this high enough to avoid client-side queuing.",
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="HTTP timeout in seconds")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory")
@@ -127,10 +135,14 @@ def post_sample(args: argparse.Namespace, sample: SampledFrame) -> Dict[str, Any
         "frame_index": sample.frame_index,
         "source_time_sec": sample.source_time_sec,
         "batch_second": sample.batch_second,
+        "scheduled_send_time_sec": sample.scheduled_send_time_sec,
+        "client_submit_offset_sec": sample.client_submit_offset_sec,
+        "client_write_offset_sec": None,
         "camera_id": args.camera_id,
         "success": False,
         "status_code": None,
         "latency_ms": None,
+        "client_response_offset_sec": None,
         "response": None,
         "error": None,
     }
@@ -143,6 +155,10 @@ def post_sample(args: argparse.Namespace, sample: SampledFrame) -> Dict[str, Any
         latency_ms = (time.time() - started_at) * 1000.0
         record["status_code"] = response.status_code
         record["latency_ms"] = latency_ms
+        if sample.client_submit_offset_sec is not None:
+            record["client_response_offset_sec"] = (
+                sample.client_submit_offset_sec + latency_ms / 1000.0
+            )
 
         if response.status_code >= 400:
             record["error"] = response.text[:1000]
@@ -156,6 +172,10 @@ def post_sample(args: argparse.Namespace, sample: SampledFrame) -> Dict[str, Any
         return record
     except Exception as exc:
         record["latency_ms"] = (time.time() - started_at) * 1000.0
+        if sample.client_submit_offset_sec is not None:
+            record["client_response_offset_sec"] = (
+                sample.client_submit_offset_sec + record["latency_ms"] / 1000.0
+            )
         record["error"] = str(exc)
         return record
 
@@ -324,54 +344,48 @@ def write_jsonl_line(handle: Any, record: Dict[str, Any]) -> None:
     handle.flush()
 
 
-def process_batch(
-    args: argparse.Namespace,
-    batch: List[SampledFrame],
+def write_completed_result(
+    sample: SampledFrame,
+    record: Dict[str, Any],
     writer: cv2.VideoWriter,
     jsonl_handle: Any,
     all_records: List[Dict[str, Any]],
+    started_at: float,
 ) -> None:
-    if not batch:
-        return
-
-    batch = sorted(batch, key=lambda item: item.sequence)
-    batch_second = batch[0].batch_second
-    print(f"batch_second={batch_second} send_count={len(batch)}")
-
-    record_by_sequence: Dict[int, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=max(1, int(args.max_workers))) as executor:
-        future_map = {executor.submit(post_sample, args, sample): sample for sample in batch}
-        for future in as_completed(future_map):
-            sample = future_map[future]
-            record = future.result()
-            record_by_sequence[sample.sequence] = record
-
-    for sample in batch:
-        record = record_by_sequence[sample.sequence]
-        all_records.append(record)
-        write_jsonl_line(jsonl_handle, record)
-        annotated = annotate_frame(sample, record)
-        writer.write(annotated)
-        print(
-            "seq={seq} frame={frame} t={t:.2f}s status={status} code={code} latency_ms={latency} {summary}".format(
-                seq=sample.sequence,
-                frame=sample.frame_index,
-                t=sample.source_time_sec,
-                status="ok" if record.get("success") else "fail",
-                code=record.get("status_code"),
-                latency=(
-                    f"{record['latency_ms']:.1f}"
-                    if isinstance(record.get("latency_ms"), (float, int))
-                    else "N/A"
-                ),
-                summary=summarize_record(record),
-            )
+    record["client_write_offset_sec"] = time.time() - started_at
+    all_records.append(record)
+    write_jsonl_line(jsonl_handle, record)
+    annotated = annotate_frame(sample, record)
+    writer.write(annotated)
+    print(
+        "result seq={seq} frame={frame} source_t={source_t:.2f}s "
+        "submit_t={submit_t:.2f}s response_t={response_t} write_t={write_t:.2f}s "
+        "status={status} code={code} latency_ms={latency} {summary}".format(
+            seq=sample.sequence,
+            frame=sample.frame_index,
+            source_t=sample.source_time_sec,
+            submit_t=sample.client_submit_offset_sec or 0.0,
+            response_t=(
+                f"{record['client_response_offset_sec']:.2f}s"
+                if isinstance(record.get("client_response_offset_sec"), (float, int))
+                else "N/A"
+            ),
+            write_t=record["client_write_offset_sec"],
+            status="ok" if record.get("success") else "fail",
+            code=record.get("status_code"),
+            latency=(
+                f"{record['latency_ms']:.1f}"
+                if isinstance(record.get("latency_ms"), (float, int))
+                else "N/A"
+            ),
+            summary=summarize_record(record),
         )
+    )
 
 
 def output_paths(output_dir: Path, video_path: Path, target_fps: float) -> Dict[str, Path]:
     stem = video_path.stem
-    suffix = f"concurrent_{target_fps:g}fps"
+    suffix = f"paced_{target_fps:g}fps"
     return {
         "video": output_dir / f"{stem}_{suffix}_annotated.mp4",
         "json": output_dir / f"{stem}_{suffix}_results.json",
@@ -412,6 +426,8 @@ def main() -> None:
     print(f"camera_id={args.camera_id}")
     print(f"source_fps={source_fps:.3f} total_frames={total_frames}")
     print(f"target_fps={args.target_fps:g} max_workers={args.max_workers}")
+    print("send_mode=paced_nonblocking")
+    print("result_write_order=response_completion_order")
     print(f"results_json={paths['json']}")
     print(f"results_jsonl={paths['jsonl']}")
     print(f"output_video={paths['video']}")
@@ -419,9 +435,9 @@ def main() -> None:
     print(f"http_proxy={os.getenv('HTTP_PROXY') or os.getenv('http_proxy')}")
     print(f"https_proxy={os.getenv('HTTPS_PROXY') or os.getenv('https_proxy')}")
 
+    future_to_sample: Dict[Future, SampledFrame] = {}
+    pending_futures = set()
     all_records: List[Dict[str, Any]] = []
-    batch: List[SampledFrame] = []
-    current_batch_second: Optional[int] = None
     sample_sequence = 0
     next_sample_time = 0.0
     sample_period = 1.0 / float(args.target_fps)
@@ -431,45 +447,103 @@ def main() -> None:
     started_at = time.time()
     try:
         with paths["jsonl"].open("w", encoding="utf-8") as jsonl_handle:
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
+            with ThreadPoolExecutor(max_workers=max(1, int(args.max_workers))) as executor:
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
 
-                source_time_sec = frame_index / source_fps
-                if args.max_seconds > 0 and source_time_sec >= args.max_seconds:
-                    stop_requested = True
+                    source_time_sec = frame_index / source_fps
+                    if args.max_seconds > 0 and source_time_sec >= args.max_seconds:
+                        stop_requested = True
 
-                if not stop_requested and source_time_sec + 1e-9 >= next_sample_time:
-                    batch_second = int(next_sample_time)
-                    if current_batch_second is None:
-                        current_batch_second = batch_second
+                    if not stop_requested and source_time_sec + 1e-9 >= next_sample_time:
+                        scheduled_send_time_sec = next_sample_time
+                        target_wall_time = started_at + scheduled_send_time_sec
+                        sleep_seconds = target_wall_time - time.time()
+                        if sleep_seconds > 0:
+                            time.sleep(sleep_seconds)
 
-                    if batch_second != current_batch_second:
-                        process_batch(args, batch, writer, jsonl_handle, all_records)
-                        batch = []
-                        current_batch_second = batch_second
-
-                    batch.append(
-                        SampledFrame(
+                        sample = SampledFrame(
                             sequence=sample_sequence,
                             frame_index=frame_index,
                             source_time_sec=source_time_sec,
-                            batch_second=batch_second,
+                            batch_second=int(scheduled_send_time_sec),
+                            scheduled_send_time_sec=scheduled_send_time_sec,
+                            client_submit_offset_sec=time.time() - started_at,
                             frame=frame.copy(),
                         )
+                        future = executor.submit(post_sample, args, sample)
+                        future_to_sample[future] = sample
+                        pending_futures.add(future)
+                        print(
+                            "sent seq={seq} frame={frame} source_t={source_t:.2f}s "
+                            "scheduled_t={scheduled_t:.2f}s submit_t={submit_t:.2f}s in_flight={in_flight}".format(
+                                seq=sample.sequence,
+                                frame=sample.frame_index,
+                                source_t=sample.source_time_sec,
+                                scheduled_t=sample.scheduled_send_time_sec,
+                                submit_t=sample.client_submit_offset_sec or 0.0,
+                                in_flight=len(pending_futures),
+                            )
+                        )
+                        sample_sequence += 1
+                        next_sample_time += sample_period
+
+                        done_futures = [future for future in list(pending_futures) if future.done()]
+                        done_futures.sort(
+                            key=lambda item: (
+                                item.result().get("client_response_offset_sec")
+                                if isinstance(item.result().get("client_response_offset_sec"), (float, int))
+                                else float("inf")
+                            )
+                        )
+                        for done_future in done_futures:
+                            pending_futures.remove(done_future)
+                            done_sample = future_to_sample.pop(done_future)
+                            done_record = done_future.result()
+                            write_completed_result(
+                                done_sample,
+                                done_record,
+                                writer,
+                                jsonl_handle,
+                                all_records,
+                                started_at,
+                            )
+
+                        if args.max_requests > 0 and sample_sequence >= args.max_requests:
+                            stop_requested = True
+
+                    frame_index += 1
+                    if stop_requested:
+                        break
+
+                print(f"all frames submitted, waiting for {len(pending_futures)} responses...")
+                while pending_futures:
+                    done, pending_futures = wait(
+                        pending_futures,
+                        timeout=None,
+                        return_when=FIRST_COMPLETED,
                     )
-                    sample_sequence += 1
-                    next_sample_time += sample_period
-
-                    if args.max_requests > 0 and sample_sequence >= args.max_requests:
-                        stop_requested = True
-
-                frame_index += 1
-                if stop_requested:
-                    break
-
-            process_batch(args, batch, writer, jsonl_handle, all_records)
+                    done_list = list(done)
+                    done_list.sort(
+                        key=lambda item: (
+                            item.result().get("client_response_offset_sec")
+                            if isinstance(item.result().get("client_response_offset_sec"), (float, int))
+                            else float("inf")
+                        )
+                    )
+                    for done_future in done_list:
+                        done_sample = future_to_sample.pop(done_future)
+                        done_record = done_future.result()
+                        write_completed_result(
+                            done_sample,
+                            done_record,
+                            writer,
+                            jsonl_handle,
+                            all_records,
+                            started_at,
+                        )
     finally:
         cap.release()
         writer.release()
@@ -482,6 +556,8 @@ def main() -> None:
                 "camera_id": args.camera_id,
                 "target_fps": args.target_fps,
                 "max_workers": args.max_workers,
+                "send_mode": "paced_nonblocking",
+                "result_write_order": "response_completion_order",
                 "source_fps": source_fps,
                 "total_records": len(all_records),
                 "success_records": sum(1 for item in all_records if item.get("success")),
