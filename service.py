@@ -95,6 +95,7 @@ class VisionAnalysisService:
         self.action_model_lock = threading.Lock()
         print(">>> UniFormer 行为识别模型按需加载，默认不初始化")
         self.PHONE_CONFIDENCE_THRESHOLD = 0.8
+        self.phone_detect_interval = 5
         # 推理间隔保持为4帧（即每隔4帧，取过去16帧进行一次识别，形成滑动窗口）
         # [修改] 将原先的 2 改为 1，实现逐帧平滑判断，与 OM 逻辑对齐
         self.action_infer_interval = 1 
@@ -277,6 +278,14 @@ class VisionAnalysisService:
         if track_id is not None:
             return f"track:{track_id}"
         return None
+
+    @staticmethod
+    def _get_phone_cache_key(person_id, track_id, current_idx, enable_tracking):
+        if enable_tracking and track_id is not None:
+            return f"track:{track_id}"
+        if person_id not in (-1, None):
+            return f"pid:{person_id}"
+        return f"idx:{current_idx}"
 
     def _estimate_observation_quality(self, detected_kp_count, keypoints_global, posture, keypoint_type):
         quality = 0.1
@@ -467,7 +476,10 @@ class VisionAnalysisService:
                     'face_vote_table': {},
                     # [新增] 记录每个 track_id 上一帧识别到的 face_id，用于判定"连续"
                     'face_last_seen': {},
-                    'track_filter_states': {}
+                    'track_filter_states': {},
+                    'phone_frame_counter': 0,
+                    'phone_conf_cache': {},
+                    'phone_behavior_enabled': False
                 }
 
             return self.camera_states[camera_id]
@@ -516,6 +528,19 @@ class VisionAnalysisService:
             face_vote_table = state['face_vote_table']
             face_last_seen = state['face_last_seen']
             track_filter_states = state['track_filter_states']
+            phone_conf_cache = state.setdefault('phone_conf_cache', {})
+            state.setdefault('phone_frame_counter', 0)
+            if enable_behavior:
+                if not state.get('phone_behavior_enabled', False):
+                    state['phone_frame_counter'] = 0
+                    phone_conf_cache.clear()
+                state['phone_behavior_enabled'] = True
+                state['phone_frame_counter'] += 1
+                should_detect_phone = (state['phone_frame_counter'] - 1) % self.phone_detect_interval == 0
+            else:
+                state['phone_behavior_enabled'] = False
+                phone_conf_cache.clear()
+                should_detect_phone = False
             current_time_sec = time.time()
 
         frame = image
@@ -541,6 +566,9 @@ class VisionAnalysisService:
         if not has_person:
             face_vote_table.clear()
             face_last_seen.clear()
+            phone_conf_cache.clear()
+            if enable_behavior:
+                state['phone_frame_counter'] = 0
             if enable_tracking:
                 reidentifier.refresh_track_state([])
             self.shared_unknown_store.cleanup_stale()
@@ -563,6 +591,8 @@ class VisionAnalysisService:
         for stale_track_id in list(face_last_seen.keys()):
             if stale_track_id not in active_track_ids:
                 face_last_seen.pop(stale_track_id, None)
+
+        active_phone_keys = set()
 
         if enable_tracking and has_person:
             with profiler.section("6_Person_ReID"):
@@ -630,11 +660,17 @@ class VisionAnalysisService:
 
             if enable_behavior:
                 with profiler.section("8_Phone_Detection"):
-                    person_box_crop = frame[
-                        max(0, y1):min(frame.shape[0], y2),
-                        max(0, x1):min(frame.shape[1], x2),
-                    ]
-                    phone_conf = self._detect_cell_phone_conf(person_box_crop)
+                    phone_key = self._get_phone_cache_key(person_id, track_id, current_idx, enable_tracking)
+                    active_phone_keys.add(phone_key)
+                    if should_detect_phone:
+                        person_box_crop = frame[
+                            max(0, y1):min(frame.shape[0], y2),
+                            max(0, x1):min(frame.shape[1], x2),
+                        ]
+                        phone_conf = self._detect_cell_phone_conf(person_box_crop)
+                        phone_conf_cache[phone_key] = phone_conf
+                    else:
+                        phone_conf = phone_conf_cache.get(phone_key, 0.0)
                     if phone_conf > self.PHONE_CONFIDENCE_THRESHOLD:
                         action_label = 'looking_at_phone'
                         action_conf = phone_conf
@@ -865,6 +901,10 @@ class VisionAnalysisService:
                 "bbox_anchor_points": bbox_anchor_points,
                 "keypoint_count": int(detected_kp_count)
             })
+
+        if enable_behavior:
+            for stale_phone_key in [key for key in phone_conf_cache if key not in active_phone_keys]:
+                phone_conf_cache.pop(stale_phone_key, None)
 
         self._cleanup_stale_track_states(track_filter_states, current_time_sec, self.ttl_keep_state)
         return len(persons_result) > 0, persons_result
