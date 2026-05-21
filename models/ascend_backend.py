@@ -6,13 +6,12 @@ from typing import Iterable, List, Sequence
 import numpy as np
 
 
-MODEL_BACKEND_ENV = "MODEL_BACKEND"
 ASCEND_DEVICE_ENV = "ASCEND_DEVICE_ID"
 
 
 def requested_backend() -> str:
-    """Return auto, om, or legacy."""
-    return os.getenv(MODEL_BACKEND_ENV, "auto").strip().lower() or "auto"
+    """Return the active model backend."""
+    return "om"
 
 
 def is_om_path(path) -> bool:
@@ -20,27 +19,10 @@ def is_om_path(path) -> bool:
 
 
 def resolve_model_path(om_path: str, legacy_path: str = None) -> str:
-    """Prefer OM models when present, while keeping old paths usable during migration."""
-    backend = requested_backend()
-    om_exists = Path(om_path).exists()
-
-    if backend in {"om", "ascend", "npu"}:
-        if not om_exists:
-            raise FileNotFoundError(
-                f"MODEL_BACKEND={backend} requires OM model, but it was not found: {om_path}"
-            )
+    """Require OM models. The legacy_path argument is kept for old call sites."""
+    if Path(om_path).exists():
         return om_path
-
-    if backend in {"legacy", "onnx", "torch", "pytorch", "cuda", "cpu"}:
-        if legacy_path is None:
-            raise FileNotFoundError(f"No legacy model path configured for {om_path}")
-        return legacy_path
-
-    if om_exists:
-        return om_path
-    if legacy_path is not None:
-        return legacy_path
-    return om_path
+    raise FileNotFoundError(f"OM model was not found: {om_path}")
 
 
 def get_ascend_device_id() -> int:

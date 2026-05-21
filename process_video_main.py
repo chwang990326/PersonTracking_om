@@ -27,14 +27,14 @@ from models.actionclassifier import preprocess_crops_for_video_cls, postprocess,
 from models.personvit_adapter import PersonViTFeatureExtractor
 from models.reid_state import SharedIdentityStore
 from models.ascend_action import AscendActionModel
-from models.ascend_backend import is_om_path, resolve_model_path
+from models.ascend_backend import is_om_path
 from models.ascend_yolo import create_yolo_model
 
-DETECTOR_ONNX_PATH = resolve_model_path('weights/yolo26x.om', 'weights/yolo26x.onnx')
-POSE_ONNX_PATH = resolve_model_path('weights/yolo26s-pose.om', 'weights/yolo26s-pose.onnx')
-PHONE_DETECTOR_ONNX_PATH = resolve_model_path('weights/yolo26x.om', 'weights/yolo26x.onnx')
-REID_MODEL_PATH = resolve_model_path('weights/transformer_120_16.om', './config/transformer_120.pth')
-ACTION_MODEL_PATH = resolve_model_path('weights/best094nophone.om', 'weights/best094nophone.pt')
+DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
+POSE_ONNX_PATH = 'weights/yolov8n-pose.om'
+PHONE_DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
+REID_MODEL_PATH = 'weights/transformer_120_16.om'
+ACTION_MODEL_PATH = 'weights/best094nophone.om'
 CELL_PHONE_CLASS_ID = 67
 
 class CameraConfigError(RuntimeError):
@@ -156,8 +156,8 @@ class VisionAnalysisService:
         print(">>> 加载人脸识别模型 (AdaFace)...")
         self.shared_face_recognizer = FaceRecognizer(
             face_gallery_path='faceImage',
-            scrfd_model_path='weights/det_10g.onnx',
-            adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
+            scrfd_model_path='weights/det_10_640.om',
+            adaface_model_path='weights/adaface_ir50_ms1mv2_b1.om',
             architecture='ir_50',
             similarity_threshold=0.5,
             detection_threshold=0.7,
@@ -824,8 +824,8 @@ class VisionAnalysisService:
         try:
             self.shared_face_recognizer = FaceRecognizer(
                 face_gallery_path='faceImage',
-                scrfd_model_path='weights/det_10g.onnx',
-                adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
+                scrfd_model_path='weights/det_10_640.om',
+                adaface_model_path='weights/adaface_ir50_ms1mv2_b1.om',
                 architecture='ir_50',
                 similarity_threshold=0.45,
                 detection_threshold=0.7,

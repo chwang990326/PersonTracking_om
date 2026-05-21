@@ -16,14 +16,14 @@ from models.geometry import (
 from models.posture_classifier import classify_posture_with_verification
 from models.personReID import PersonReidentifier
 from models.face import FaceRecognizer
-from models.ascend_backend import is_om_path, resolve_model_path
+from models.ascend_backend import is_om_path
 from models.ascend_yolo import create_yolo_model
 # --- 新增导入 ---
 # from utils.get_model import getmodel
 # from models.actionclassifier import preprocess_crops_for_video_cls, postprocess
 
-DETECTOR_ONNX_PATH = resolve_model_path('weights/yolo26x.om', 'weights/yolo26x.onnx')
-POSE_ONNX_PATH = resolve_model_path('weights/yolo26s-pose.om', 'weights/yolo26s-pose.onnx')
+DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
+POSE_ONNX_PATH = 'weights/yolov8n-pose.om'
 
 def main():
     # --- 1. 配置和初始化 ---
@@ -54,8 +54,8 @@ def main():
     # --- 初始化自定义ReID系统 ---
     face_recognizer = FaceRecognizer(
             face_gallery_path='faceImage',
-            scrfd_model_path='weights/det_10g.onnx',
-            adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
+            scrfd_model_path='weights/det_10_640.om',
+            adaface_model_path='weights/adaface_ir50_ms1mv2_b1.om',
             architecture='ir_50',
             similarity_threshold=0.45,
             detection_threshold=0.7,

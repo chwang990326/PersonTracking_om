@@ -39,8 +39,8 @@ class FaceRecognizer:
     
     def __init__(self, 
                  face_gallery_path='faceImage',
-                 scrfd_model_path='weights/det_10g.onnx',
-                 adaface_model_path='weights/adaface_ir50_ms1mv2.ckpt',
+                 scrfd_model_path='weights/det_10_640.om',
+                 adaface_model_path='weights/adaface_ir50_ms1mv2_b1.om',
                  architecture='ir_50',
                  similarity_threshold=0.35,
                  detection_threshold=0.5,
