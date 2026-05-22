@@ -19,7 +19,7 @@ class PersonReidentifier:
     """
 
     def __init__(self, identity_folder='identity', 
-                 model_path='weights/transformer_120.onnx',
+                 model_path='weights/transformer_120_16.om',
                  # config_file='models/transreid_pytorch/configs/msmt17/vit_base_ics_384.yml',
                  config_file='./models/transreid_pytorch/configs/market/vit_base.yml',
                  similarity_threshold=0.9, 

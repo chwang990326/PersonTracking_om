@@ -34,7 +34,7 @@ from utils.profiler import RequestProfiler
 DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
 POSE_ONNX_PATH = 'weights/yolov8n-pose.om'
 PHONE_DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
-REID_MODEL_PATH = 'weights/transformer_120.onnx'
+REID_MODEL_PATH = 'weights/transformer_120_16.om'
 ACTION_MODEL_PATH = 'weights/best094nophone.om'
 CELL_PHONE_CLASS_ID = 67
 
