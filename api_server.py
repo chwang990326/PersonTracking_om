@@ -1,8 +1,11 @@
 import time
 import base64
+import asyncio
+import threading
 import cv2
 import numpy as np
 import uvicorn
+from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
@@ -85,6 +88,159 @@ def get_current_timestamp():
     return int(time.time() * 1000)
 
 # --- 3. 辅助函数：Base64 转 OpenCV ---
+@dataclass
+class CameraFrameJob:
+    camera_id: str
+    request: PersonDetectRequest
+    image: np.ndarray
+    profiler: RequestProfiler
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future
+
+
+class CameraQueueState:
+    def __init__(self, camera_id: str):
+        self.camera_id = camera_id
+        self.lock = threading.Lock()
+        self.processing = False
+        self.pending_job = None
+
+
+class CameraOrderedProcessor:
+    """
+    Serialize stateful tracking/ReID calls by camera_id.
+
+    Each camera has at most one frame being processed and one latest waiting
+    frame. When overloaded, the older waiting frame is dropped so processing
+    stays close to real time.
+    """
+
+    def __init__(self, vision_service: VisionAnalysisService):
+        self.service = vision_service
+        self.states = {}
+        self.states_lock = threading.Lock()
+
+    def _get_state(self, camera_id: str) -> CameraQueueState:
+        with self.states_lock:
+            state = self.states.get(camera_id)
+            if state is None:
+                state = CameraQueueState(camera_id)
+                self.states[camera_id] = state
+            return state
+
+    def _complete_job(self, job: CameraFrameJob, response: BaseResponse):
+        def set_result():
+            if not job.future.done():
+                job.future.set_result(response)
+
+        job.loop.call_soon_threadsafe(set_result)
+
+    def _dropped_response(self) -> BaseResponse:
+        return BaseResponse(
+            code=1203,
+            message="旧帧已丢弃，已保留最新等待帧",
+            timestamp=get_current_timestamp(),
+        )
+
+    def _process_job(self, job: CameraFrameJob) -> BaseResponse:
+        request = job.request
+        try:
+            with job.profiler.section("2_Service_Detect"):
+                service_profiler = RequestProfiler()
+                exist_person, persons = self.service.detect_person_from_image(
+                    job.image,
+                    camera_id=request.camera_id,
+                    enable_face=request.enable_face_recognition,
+                    enable_behavior=request.enable_behavior_detection,
+                    enable_uniformer=request.enable_uniformer_inference,
+                    enable_positioning=request.enable_spatial_positioning,
+                    enable_tracking=request.enable_target_tracking,
+                    profiler=service_profiler,
+                )
+            job.profiler.merge(service_profiler)
+
+            with job.profiler.section("3_Response_Build"):
+                return BaseResponse(
+                    code=0,
+                    message="操作成功",
+                    data=DetectResponseData(exist_person=exist_person, persons=persons),
+                    timestamp=get_current_timestamp(),
+                )
+
+        except CameraConfigError as e:
+            return BaseResponse(
+                code=1202,
+                message=str(e),
+                timestamp=get_current_timestamp(),
+            )
+        except Exception as e:
+            print(f"Internal Error: {e}")
+            return BaseResponse(
+                code=1400,
+                message=f"系统内部错误: {str(e)}",
+                timestamp=get_current_timestamp(),
+            )
+
+    def _run_camera_loop(self, state: CameraQueueState, first_job: CameraFrameJob):
+        job = first_job
+        while job is not None:
+            response = self._process_job(job)
+            self._complete_job(job, response)
+
+            with state.lock:
+                job = state.pending_job
+                state.pending_job = None
+                if job is None:
+                    state.processing = False
+                    return
+
+    async def submit(self, request: PersonDetectRequest, image: np.ndarray, profiler: RequestProfiler) -> BaseResponse:
+        camera_id = request.camera_id or "default"
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        job = CameraFrameJob(
+            camera_id=camera_id,
+            request=request,
+            image=image,
+            profiler=profiler,
+            loop=loop,
+            future=future,
+        )
+
+        state = self._get_state(camera_id)
+        dropped_job = None
+        start_worker = False
+
+        with state.lock:
+            if state.processing:
+                dropped_job = state.pending_job
+                state.pending_job = job
+            else:
+                state.processing = True
+                start_worker = True
+
+        if dropped_job is not None:
+            print(
+                f"[CameraQueue] drop stale waiting frame "
+                f"camera_id={dropped_job.camera_id} timestamp={dropped_job.request.timestamp}"
+            )
+            self._complete_job(dropped_job, self._dropped_response())
+
+        if start_worker:
+            thread = threading.Thread(
+                target=self._run_camera_loop,
+                args=(state, job),
+                name=f"camera-processor-{camera_id}",
+                daemon=True,
+            )
+            thread.start()
+
+        return await future
+
+
+camera_processor = CameraOrderedProcessor(service)
+
+
 def base64_to_cv2(base64_str):
     try:
         # 去掉可能存在的头部 "data:image/jpeg;base64,"
@@ -123,31 +279,7 @@ async def person_detect(request: PersonDetectRequest):
         return response
 
     try:
-        # 2. 调用业务层逻辑
-        # [修改] 正确解包返回的元组 (注意 service.py 返回顺序是 exist_person, persons)
-        with profiler.section("2_Service_Detect"):
-            service_profiler = RequestProfiler()
-            exist_person, persons = service.detect_person_from_image(
-                img,
-                camera_id=request.camera_id,
-                enable_face=request.enable_face_recognition,
-                enable_behavior=request.enable_behavior_detection,
-                enable_uniformer=request.enable_uniformer_inference,
-                enable_positioning=request.enable_spatial_positioning,
-                enable_tracking=request.enable_target_tracking,
-                profiler=service_profiler,
-            )
-        profiler.merge(service_profiler)
-        
-        # 3. 构造成功响应
-        with profiler.section("3_Response_Build"):
-            response = BaseResponse(
-                code=0,
-            message="操作成功",
-            # [修改] 将两个参数分别传入
-            data=DetectResponseData(exist_person=exist_person, persons=persons),
-            timestamp=get_current_timestamp()
-        )
+        response = await camera_processor.submit(request, img, profiler)
         profiler.stop("0_Request_Total")
         api_profiler_stats.record(profiler)
         return response
