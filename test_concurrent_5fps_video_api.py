@@ -27,7 +27,7 @@ import cv2
 import requests
 
 
-DEFAULT_VIDEO_PATH = "video/test2.mp4"
+DEFAULT_VIDEO_PATH = "video/test1.mp4"
 DEFAULT_API_URL = "http://192.168.100.64:8135/api/v1/person/detect"
 DEFAULT_CAMERA_ID = "207"
 DEFAULT_TARGET_FPS = 5.0
