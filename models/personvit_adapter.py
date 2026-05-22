@@ -18,7 +18,7 @@ except ImportError:
 
 from models.transreid_pytorch.config import cfg
 from models.transreid_pytorch.model import make_model
-from models.ascend_backend import AscendInferSession, is_om_path, l2_normalize
+from models.ascend_backend import AscendInferSession, get_ascend_device_id, is_om_path, l2_normalize
 
 class PersonViTFeatureExtractor:
     def __init__(self, model_path, config_file, device='cuda'):
@@ -62,14 +62,36 @@ class PersonViTFeatureExtractor:
 
             available_providers = ort.get_available_providers()
             preferred_providers = []
+            if "CANNExecutionProvider" in available_providers:
+                cann_options = {
+                    "device_id": get_ascend_device_id(),
+                    "arena_extend_strategy": os.getenv("ORT_CANN_ARENA_EXTEND_STRATEGY", "kNextPowerOfTwo"),
+                    "enable_cann_graph": os.getenv("ORT_CANN_ENABLE_GRAPH", "1") not in {"0", "false", "False"},
+                    "enable_cann_subgraph": os.getenv("ORT_CANN_ENABLE_SUBGRAPH", "1") not in {"0", "false", "False"},
+                    "precision_mode": os.getenv("ORT_CANN_PRECISION_MODE", "allow_fp32_to_fp16"),
+                    "op_select_impl_mode": os.getenv("ORT_CANN_OP_SELECT_IMPL_MODE", "high_precision"),
+                }
+                npu_mem_limit = os.getenv("ORT_CANN_NPU_MEM_LIMIT")
+                if npu_mem_limit:
+                    try:
+                        cann_options["npu_mem_limit"] = int(npu_mem_limit)
+                    except ValueError:
+                        print(f"[PersonViT] Ignoring invalid ORT_CANN_NPU_MEM_LIMIT={npu_mem_limit!r}")
+                preferred_providers.append(("CANNExecutionProvider", cann_options))
             if str(device).startswith("cuda"):
                 preferred_providers.append("CUDAExecutionProvider")
             preferred_providers.append("CPUExecutionProvider")
-            providers = [p for p in preferred_providers if p in available_providers] or available_providers
+            providers = [
+                provider
+                for provider in preferred_providers
+                if (provider[0] if isinstance(provider, tuple) else provider) in available_providers
+            ] or available_providers
 
             print(f"[PersonViT] Loading ONNX model from {model_path}")
+            print(f"[PersonViT] ONNX available providers: {available_providers}")
             print(f"[PersonViT] ONNX providers: {providers}")
             self.session = ort.InferenceSession(model_path, providers=providers)
+            print(f"[PersonViT] ONNX active providers: {self.session.get_providers()}")
             self.onnx_inputs = self.session.get_inputs()
             self.onnx_output_names = [output.name for output in self.session.get_outputs()]
             self.onnx_image_input_name = self._find_onnx_image_input_name()
