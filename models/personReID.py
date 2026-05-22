@@ -10,7 +10,6 @@ import time
 from models.personvit_adapter import PersonViTFeatureExtractor
 from models.reid_state import SharedIdentityStore
 from models.transreid_pytorch.utils.reranking import re_ranking
-from models.ascend_backend import resolve_model_path
 
 auto_save = True
 
@@ -20,7 +19,7 @@ class PersonReidentifier:
     """
 
     def __init__(self, identity_folder='identity', 
-                 model_path='weights/transformer_120_16.om',
+                 model_path='weights/transformer_120.onnx',
                  # config_file='models/transreid_pytorch/configs/msmt17/vit_base_ics_384.yml',
                  config_file='./models/transreid_pytorch/configs/market/vit_base.yml',
                  similarity_threshold=0.9, 
@@ -50,7 +49,8 @@ class PersonReidentifier:
             id_generator (callable): 全局唯一的ID生成函数，返回下一个可用的临时ID
         """
         print("[ReID] 初始化系统...")
-        model_path = resolve_model_path('weights/transformer_120_16.om', model_path)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"ReID model was not found: {model_path}")
         self.identity_folder = identity_folder
         if known_similarity_threshold is None:
             known_similarity_threshold = similarity_threshold

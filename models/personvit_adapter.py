@@ -1,11 +1,17 @@
 import sys
 import os
+import threading
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 import numpy as np
 import cv2
+
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
 
 # 动态添加 transreid_pytorch 到系统路径，确保能导入其内部模块
 # # sys.path.append(os.path.join(os.path.dirname(__file__), 'transreid_pytorch'))
@@ -24,6 +30,7 @@ class PersonViTFeatureExtractor:
         """
         self.device = device
         self.use_om = is_om_path(model_path)
+        self.use_onnx = str(model_path).lower().endswith(".onnx")
         
         # 解冻
         cfg.defrost()
@@ -33,7 +40,7 @@ class PersonViTFeatureExtractor:
         self.pixel_mean = np.asarray(cfg.INPUT.PIXEL_MEAN, dtype=np.float32).reshape(3, 1, 1)
         self.pixel_std = np.asarray(cfg.INPUT.PIXEL_STD, dtype=np.float32).reshape(3, 1, 1)
 
-        if not self.use_om:
+        if not self.use_om and not self.use_onnx:
             # [新增] 关键修复：将预训练路径强制指向传入的 model_path
             # 这解决了两个问题：
             # 1. 避免了 PRETRAIN_PATH 为空导致的 FileNotFoundError
@@ -45,6 +52,28 @@ class PersonViTFeatureExtractor:
         if self.use_om:
             print(f"[PersonViT] Loading Ascend OM model from {model_path}")
             self.session = AscendInferSession(model_path)
+            self.model = None
+            self.transforms = None
+            return
+
+        if self.use_onnx:
+            if ort is None:
+                raise ImportError("onnxruntime is required for PersonViT ONNX inference")
+
+            available_providers = ort.get_available_providers()
+            preferred_providers = []
+            if str(device).startswith("cuda"):
+                preferred_providers.append("CUDAExecutionProvider")
+            preferred_providers.append("CPUExecutionProvider")
+            providers = [p for p in preferred_providers if p in available_providers] or available_providers
+
+            print(f"[PersonViT] Loading ONNX model from {model_path}")
+            print(f"[PersonViT] ONNX providers: {providers}")
+            self.session = ort.InferenceSession(model_path, providers=providers)
+            self.onnx_inputs = self.session.get_inputs()
+            self.onnx_output_names = [output.name for output in self.session.get_outputs()]
+            self.onnx_image_input_name = self._find_onnx_image_input_name()
+            self.onnx_lock = threading.Lock()
             self.model = None
             self.transforms = None
             return
@@ -81,6 +110,58 @@ class PersonViTFeatureExtractor:
         chw = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
         return (chw - self.pixel_mean) / self.pixel_std
 
+    def _find_onnx_image_input_name(self):
+        for input_meta in self.onnx_inputs:
+            shape = input_meta.shape or []
+            if len(shape) == 4:
+                return input_meta.name
+        if not self.onnx_inputs:
+            raise RuntimeError("ONNX ReID model has no inputs")
+        return self.onnx_inputs[0].name
+
+    @staticmethod
+    def _onnx_dtype(input_type):
+        if "int64" in input_type:
+            return np.int64
+        if "int32" in input_type:
+            return np.int32
+        return np.float32
+
+    @staticmethod
+    def _onnx_shape(input_shape, batch_size):
+        if not input_shape:
+            return (batch_size,)
+
+        shape = []
+        for idx, dim in enumerate(input_shape):
+            if idx == 0:
+                shape.append(batch_size)
+            elif isinstance(dim, int) and dim > 0:
+                shape.append(dim)
+            else:
+                shape.append(1)
+        return tuple(shape)
+
+    def _build_onnx_feed(self, blob):
+        batch_size = int(blob.shape[0])
+        feed = {}
+        for input_meta in self.onnx_inputs:
+            if input_meta.name == self.onnx_image_input_name:
+                feed[input_meta.name] = blob
+                continue
+
+            dtype = self._onnx_dtype(input_meta.type)
+            shape = self._onnx_shape(input_meta.shape, batch_size)
+            feed[input_meta.name] = np.zeros(shape, dtype=dtype)
+        return feed
+
+    def _run_onnx_blob(self, blob):
+        feed = self._build_onnx_feed(blob)
+        with self.onnx_lock:
+            outputs = self.session.run(self.onnx_output_names, feed)
+        feature = np.asarray(outputs[0], dtype=np.float32).reshape(blob.shape[0], -1)
+        return feature
+
     def _infer_om_batch(self, images):
         if not images:
             return torch.empty(0, 768)
@@ -95,6 +176,28 @@ class PersonViTFeatureExtractor:
         features = l2_normalize(np.stack(features, axis=0).astype(np.float32), axis=1)
         return torch.from_numpy(features)
 
+    def _infer_onnx_batch(self, images):
+        if not images:
+            return torch.empty(0, 768)
+
+        blobs = np.stack(
+            [self._preprocess_om_image(img) for img in images],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+        try:
+            features = self._run_onnx_blob(blobs)
+        except Exception:
+            if len(images) == 1:
+                raise
+            features = np.concatenate(
+                [self._run_onnx_blob(blobs[i:i + 1]) for i in range(len(images))],
+                axis=0,
+            )
+
+        features = l2_normalize(features.astype(np.float32), axis=1)
+        return torch.from_numpy(features)
+
     def __call__(self, input_image):
         """
         执行推理，接口模仿 torchreid
@@ -104,6 +207,10 @@ class PersonViTFeatureExtractor:
         if self.use_om:
             images = input_image if isinstance(input_image, list) else [input_image]
             return self._infer_om_batch(images)
+
+        if self.use_onnx:
+            images = input_image if isinstance(input_image, list) else [input_image]
+            return self._infer_onnx_batch(images)
 
         # [新增] 支持批量输入 (List of images)
         if isinstance(input_image, list):
