@@ -1,11 +1,11 @@
 """
 Paced multi-camera 5 FPS video client for /api/v1/person/detect.
 
-The script samples one video at 5 FPS and submits the same sampled frame for
-multiple camera IDs at the same cadence. It does not wait for previous
-responses before sending the next frame, so each camera can have multiple
-requests in flight. Full responses and annotated MP4s are written separately
-for every camera under a new results/ run directory.
+The script samples one video per camera at 5 FPS and submits each camera's
+sampled frame at the same cadence. It does not wait for previous responses
+before sending the next frame, so each camera can have multiple requests in
+flight. Full responses and annotated MP4s are written separately for every
+camera under a new results/ run directory.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import cv2
 import requests
 
 
-DEFAULT_VIDEO_PATH = "video/test1.mp4"
+DEFAULT_VIDEO_PATHS = "video/test1.mp4,video/test2.mp4,video/test3.mp4,video/test4.mp4"
 DEFAULT_API_URL = "http://192.168.100.64:8135/api/v1/person/detect"
 DEFAULT_CAMERA_IDS = "203,204,205,207"
 DEFAULT_TARGET_FPS = 5.0
@@ -44,6 +44,7 @@ _THREAD_LOCAL = threading.local()
 @dataclass
 class SampledFrame:
     camera_id: str
+    video_path: str
     sequence: int
     frame_index: int
     source_time_sec: float
@@ -53,14 +54,37 @@ class SampledFrame:
     frame: Any
 
 
+@dataclass
+class CameraVideoState:
+    camera_id: str
+    video_path: Path
+    cap: Any
+    source_fps: float
+    width: int
+    height: int
+    total_frames: int
+    next_frame_pos: int = 0
+    sequence: int = 0
+    exhausted: bool = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Send video/test1.mp4 frames to the person detect API at a fixed "
-            "5 FPS cadence without waiting for previous responses."
+            "Send one video stream per camera to the person detect API at a "
+            "fixed FPS cadence without waiting for previous responses."
         )
     )
-    parser.add_argument("--video-path", default=DEFAULT_VIDEO_PATH, help="Input video path")
+    parser.add_argument(
+        "--video-paths",
+        default=DEFAULT_VIDEO_PATHS,
+        help="Comma-separated input video paths, mapped one-to-one with --camera-ids",
+    )
+    parser.add_argument(
+        "--video-path",
+        default=None,
+        help="Single input video path override, reused for every camera",
+    )
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Person detect API URL")
     parser.add_argument(
         "--camera-ids",
@@ -113,6 +137,23 @@ def parse_camera_ids(args: argparse.Namespace) -> List[str]:
     return camera_ids
 
 
+def parse_video_paths(args: argparse.Namespace, camera_ids: List[str]) -> List[Path]:
+    if args.video_path:
+        raw_paths = [args.video_path]
+    else:
+        raw_paths = [item.strip() for item in str(args.video_paths).split(",") if item.strip()]
+
+    if len(raw_paths) == 1 and len(camera_ids) > 1:
+        raw_paths = raw_paths * len(camera_ids)
+
+    if len(raw_paths) != len(camera_ids):
+        raise ValueError(
+            f"video path count ({len(raw_paths)}) must be 1 or match camera count ({len(camera_ids)})"
+        )
+
+    return [Path(item) for item in raw_paths]
+
+
 def get_session(trust_env_proxy: bool) -> requests.Session:
     session = getattr(_THREAD_LOCAL, "session", None)
     if session is None:
@@ -152,6 +193,7 @@ def post_sample(args: argparse.Namespace, sample: SampledFrame) -> Dict[str, Any
     started_at = time.time()
     record: Dict[str, Any] = {
         "sequence": sample.sequence,
+        "video_path": sample.video_path,
         "frame_index": sample.frame_index,
         "source_time_sec": sample.source_time_sec,
         "batch_second": sample.batch_second,
@@ -403,10 +445,10 @@ def write_completed_result(
     )
 
 
-def make_run_dir(output_dir: Path, video_path: Path, target_fps: float, run_name: str) -> Path:
+def make_run_dir(output_dir: Path, target_fps: float, run_name: str) -> Path:
     if not run_name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_name = f"{video_path.stem}_multi_camera_{target_fps:g}fps_{timestamp}"
+        run_name = f"multi_camera_{target_fps:g}fps_{timestamp}"
     return output_dir / run_name
 
 
@@ -425,41 +467,55 @@ def output_paths(run_dir: Path, video_path: Path, target_fps: float, camera_id: 
 def main() -> None:
     args = parse_args()
     camera_ids = parse_camera_ids(args)
-    video_path = Path(args.video_path)
+    video_paths = parse_video_paths(args, camera_ids)
     output_dir = Path(args.output_dir)
-    run_dir = make_run_dir(output_dir, video_path, args.target_fps, args.run_name)
+    run_dir = make_run_dir(output_dir, args.target_fps, args.run_name)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    if not video_path.exists():
-        raise FileNotFoundError(f"Input video not found: {video_path}")
+    camera_states: Dict[str, CameraVideoState] = {}
+    for camera_id, video_path in zip(camera_ids, video_paths):
+        if not video_path.exists():
+            raise FileNotFoundError(f"Input video not found for camera {camera_id}: {video_path}")
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open input video: {video_path}")
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open input video for camera {camera_id}: {video_path}")
 
-    source_fps = cap.get(cv2.CAP_PROP_FPS)
-    if source_fps <= 0 or math.isnan(source_fps):
-        source_fps = 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        source_fps = cap.get(cv2.CAP_PROP_FPS)
+        if source_fps <= 0 or math.isnan(source_fps):
+            source_fps = 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        camera_states[camera_id] = CameraVideoState(
+            camera_id=camera_id,
+            video_path=video_path,
+            cap=cap,
+            source_fps=source_fps,
+            width=width,
+            height=height,
+            total_frames=total_frames,
+        )
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     paths_by_camera: Dict[str, Dict[str, Path]] = {}
-    for camera_id in camera_ids:
-        paths = output_paths(run_dir, video_path, args.target_fps, camera_id)
+    for camera_id, state in camera_states.items():
+        paths = output_paths(run_dir, state.video_path, args.target_fps, camera_id)
         paths["dir"].mkdir(parents=True, exist_ok=True)
         paths_by_camera[camera_id] = paths
 
-    print(f"video_path={video_path}")
     print(f"api_url={args.api_url}")
     print(f"camera_ids={','.join(camera_ids)}")
-    print(f"source_fps={source_fps:.3f} total_frames={total_frames}")
     print(f"target_fps={args.target_fps:g} max_workers={args.max_workers}")
     print("send_mode=paced_nonblocking")
     print("result_write_order=response_completion_order")
     print(f"run_dir={run_dir}")
     for camera_id, paths in paths_by_camera.items():
+        state = camera_states[camera_id]
+        print(
+            f"camera={camera_id} video_path={state.video_path} "
+            f"source_fps={state.source_fps:.3f} total_frames={state.total_frames}"
+        )
         print(f"camera={camera_id} results_json={paths['json']}")
         print(f"camera={camera_id} results_jsonl={paths['jsonl']}")
         print(f"camera={camera_id} output_video={paths['video']}")
@@ -469,19 +525,22 @@ def main() -> None:
 
     future_to_sample: Dict[Future, SampledFrame] = {}
     pending_futures = set()
-    sample_sequence_by_camera = {camera_id: 0 for camera_id in camera_ids}
     total_submitted = 0
     next_sample_time = 0.0
     sample_period = 1.0 / float(args.target_fps)
-    frame_index = 0
-    stop_requested = False
 
     started_at = time.time()
     outputs: Dict[str, Dict[str, Any]] = {}
     try:
         with ExitStack() as stack:
             for camera_id, paths in paths_by_camera.items():
-                writer = cv2.VideoWriter(str(paths["video"]), fourcc, float(args.target_fps), (width, height))
+                state = camera_states[camera_id]
+                writer = cv2.VideoWriter(
+                    str(paths["video"]),
+                    fourcc,
+                    float(args.target_fps),
+                    (state.width, state.height),
+                )
                 if not writer.isOpened():
                     raise RuntimeError(f"Cannot open output video writer: {paths['video']}")
                 jsonl_handle = stack.enter_context(paths["jsonl"].open("w", encoding="utf-8"))
@@ -493,78 +552,95 @@ def main() -> None:
                 }
 
             with ThreadPoolExecutor(max_workers=max(1, int(args.max_workers))) as executor:
-                while True:
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
+                while any(not state.exhausted for state in camera_states.values()):
+                    scheduled_send_time_sec = next_sample_time
+                    target_wall_time = started_at + scheduled_send_time_sec
+                    sleep_seconds = target_wall_time - time.time()
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
 
-                    source_time_sec = frame_index / source_fps
-                    if args.max_seconds > 0 and source_time_sec >= args.max_seconds:
-                        stop_requested = True
+                    submit_offset = time.time() - started_at
+                    for camera_id in camera_ids:
+                        state = camera_states[camera_id]
+                        if state.exhausted:
+                            continue
 
-                    if not stop_requested and source_time_sec + 1e-9 >= next_sample_time:
-                        scheduled_send_time_sec = next_sample_time
-                        target_wall_time = started_at + scheduled_send_time_sec
-                        sleep_seconds = target_wall_time - time.time()
-                        if sleep_seconds > 0:
-                            time.sleep(sleep_seconds)
+                        source_time_sec = state.next_frame_pos / state.source_fps
+                        if args.max_seconds > 0 and source_time_sec >= args.max_seconds:
+                            state.exhausted = True
+                            continue
 
-                        submit_offset = time.time() - started_at
-                        for camera_id in camera_ids:
-                            sample = SampledFrame(
-                                camera_id=camera_id,
-                                sequence=sample_sequence_by_camera[camera_id],
-                                frame_index=frame_index,
-                                source_time_sec=source_time_sec,
-                                batch_second=int(scheduled_send_time_sec),
-                                scheduled_send_time_sec=scheduled_send_time_sec,
-                                client_submit_offset_sec=submit_offset,
-                                frame=frame.copy(),
-                            )
-                            future = executor.submit(post_sample, args, sample)
-                            future_to_sample[future] = sample
-                            pending_futures.add(future)
-                            print(
-                                "sent camera={camera} seq={seq} frame={frame} source_t={source_t:.2f}s "
-                                "scheduled_t={scheduled_t:.2f}s submit_t={submit_t:.2f}s in_flight={in_flight}".format(
-                                    camera=sample.camera_id,
-                                    seq=sample.sequence,
-                                    frame=sample.frame_index,
-                                    source_t=sample.source_time_sec,
-                                    scheduled_t=sample.scheduled_send_time_sec,
-                                    submit_t=sample.client_submit_offset_sec or 0.0,
-                                    in_flight=len(pending_futures),
-                                )
-                            )
-                            sample_sequence_by_camera[camera_id] += 1
-                            total_submitted += 1
+                        ok, frame = state.cap.read()
+                        if not ok:
+                            state.exhausted = True
+                            continue
 
-                        next_sample_time += sample_period
+                        frame_index = state.next_frame_pos
+                        state.next_frame_pos += 1
 
-                        done_futures = [future for future in list(pending_futures) if future.done()]
-                        done_futures.sort(
-                            key=lambda item: (
-                                item.result().get("client_response_offset_sec")
-                                if isinstance(item.result().get("client_response_offset_sec"), (float, int))
-                                else float("inf")
+                        if frame_index + 1 < state.total_frames:
+                            target_frame_pos = int(round((scheduled_send_time_sec + sample_period) * state.source_fps))
+                            target_frame_pos = max(state.next_frame_pos, target_frame_pos)
+                            if target_frame_pos > state.next_frame_pos:
+                                state.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_pos)
+                                state.next_frame_pos = target_frame_pos
+
+                        sample = SampledFrame(
+                            camera_id=camera_id,
+                            video_path=str(state.video_path),
+                            sequence=state.sequence,
+                            frame_index=frame_index,
+                            source_time_sec=source_time_sec,
+                            batch_second=int(scheduled_send_time_sec),
+                            scheduled_send_time_sec=scheduled_send_time_sec,
+                            client_submit_offset_sec=submit_offset,
+                            frame=frame.copy(),
+                        )
+                        future = executor.submit(post_sample, args, sample)
+                        future_to_sample[future] = sample
+                        pending_futures.add(future)
+                        print(
+                            "sent camera={camera} seq={seq} frame={frame} source_t={source_t:.2f}s "
+                            "scheduled_t={scheduled_t:.2f}s submit_t={submit_t:.2f}s in_flight={in_flight}".format(
+                                camera=sample.camera_id,
+                                seq=sample.sequence,
+                                frame=sample.frame_index,
+                                source_t=sample.source_time_sec,
+                                scheduled_t=sample.scheduled_send_time_sec,
+                                submit_t=sample.client_submit_offset_sec or 0.0,
+                                in_flight=len(pending_futures),
                             )
                         )
-                        for done_future in done_futures:
-                            pending_futures.remove(done_future)
-                            done_sample = future_to_sample.pop(done_future)
-                            done_record = done_future.result()
-                            write_completed_result(
-                                done_sample,
-                                done_record,
-                                outputs,
-                                started_at,
-                            )
+                        state.sequence += 1
+                        total_submitted += 1
 
-                        if args.max_requests > 0 and total_submitted >= args.max_requests:
-                            stop_requested = True
+                    next_sample_time += sample_period
 
-                    frame_index += 1
-                    if stop_requested:
+                    done_futures = [future for future in list(pending_futures) if future.done()]
+                    done_futures.sort(
+                        key=lambda item: (
+                            item.result().get("client_response_offset_sec")
+                            if isinstance(item.result().get("client_response_offset_sec"), (float, int))
+                            else float("inf")
+                        )
+                    )
+                    for done_future in done_futures:
+                        pending_futures.remove(done_future)
+                        done_sample = future_to_sample.pop(done_future)
+                        done_record = done_future.result()
+                        write_completed_result(
+                            done_sample,
+                            done_record,
+                            outputs,
+                            started_at,
+                        )
+
+                    if args.max_requests > 0 and total_submitted >= args.max_requests:
+                        for state in camera_states.values():
+                            state.exhausted = True
+                        break
+
+                    if not any(not state.exhausted for state in camera_states.values()):
                         break
 
                 print(f"all frames submitted, waiting for {len(pending_futures)} responses...")
@@ -592,19 +668,20 @@ def main() -> None:
                             started_at,
                         )
     finally:
-        cap.release()
+        for state in camera_states.values():
+            state.cap.release()
 
     elapsed_seconds = time.time() - started_at
     summary = {
-        "video_path": str(video_path),
+        "video_paths": {camera_id: str(state.video_path) for camera_id, state in camera_states.items()},
         "api_url": args.api_url,
         "camera_ids": camera_ids,
         "target_fps": args.target_fps,
         "max_workers": args.max_workers,
         "send_mode": "paced_nonblocking",
         "result_write_order": "response_completion_order",
-        "source_fps": source_fps,
         "elapsed_seconds": elapsed_seconds,
+        "total_submitted": total_submitted,
         "cameras": {},
     }
 
@@ -612,6 +689,9 @@ def main() -> None:
         records = outputs.get(camera_id, {}).get("records", [])
         camera_summary = {
             "camera_id": camera_id,
+            "video_path": str(camera_states[camera_id].video_path),
+            "source_fps": camera_states[camera_id].source_fps,
+            "total_source_frames": camera_states[camera_id].total_frames,
             "json": str(paths["json"]),
             "jsonl": str(paths["jsonl"]),
             "video": str(paths["video"]),
@@ -622,14 +702,14 @@ def main() -> None:
         with paths["json"].open("w", encoding="utf-8") as handle:
             json.dump(
                 {
-                "video_path": str(video_path),
+                "video_path": str(camera_states[camera_id].video_path),
                 "api_url": args.api_url,
                 "camera_id": camera_id,
                 "target_fps": args.target_fps,
                 "max_workers": args.max_workers,
                 "send_mode": "paced_nonblocking",
                 "result_write_order": "response_completion_order",
-                "source_fps": source_fps,
+                "source_fps": camera_states[camera_id].source_fps,
                 "total_records": len(records),
                 "success_records": sum(1 for item in records if item.get("success")),
                 "elapsed_seconds": elapsed_seconds,
