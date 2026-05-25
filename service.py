@@ -32,7 +32,7 @@ from models.ascend_yolo import create_yolo_model
 from utils.profiler import RequestProfiler
 
 POSE_ONNX_PATH = 'weights/yolo26x-pose.om'
-PHONE_DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
+PHONE_DETECTOR_ONNX_PATH = 'weights/yolo26n.om'
 REID_MODEL_PATH = 'weights/transformer_120_16.om'
 ACTION_MODEL_PATH = 'weights/best094nophone.om'
 CELL_PHONE_CLASS_ID = 67
@@ -447,9 +447,11 @@ class VisionAnalysisService:
     def get_camera_state(self, camera_id):
         with self.camera_states_lock:
             if camera_id not in self.camera_states:
+                pose_detector = create_yolo_model(self.pose_path, task='pose')
+                print(f">>> YOLO-Pose model loaded for camera_id={camera_id}: {self.pose_path}")
                 self.camera_states[camera_id] = {
                     # [新增] 为每个相机初始化独立的检测器
-                    'detector': create_yolo_model(self.pose_path, task='pose'),
+                    'detector': pose_detector,
                     
                     'reidentifier': PersonReidentifier(
                         identity_folder=self.identity_folder,
