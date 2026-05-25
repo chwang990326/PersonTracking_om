@@ -31,8 +31,7 @@ from models.ascend_backend import is_om_path
 from models.ascend_yolo import create_yolo_model
 from utils.profiler import RequestProfiler
 
-DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
-POSE_ONNX_PATH = 'weights/yolov8n-pose.om'
+POSE_ONNX_PATH = 'weights/yolo26x-pose.om'
 PHONE_DETECTOR_ONNX_PATH = 'weights/yolo26x.om'
 REID_MODEL_PATH = 'weights/transformer_120_16.om'
 ACTION_MODEL_PATH = 'weights/best094nophone.om'
@@ -54,7 +53,7 @@ class VisionAnalysisService:
         # 2. 加载共享模型
         self.using_om_models = any(
             is_om_path(path)
-            for path in (DETECTOR_ONNX_PATH, POSE_ONNX_PATH, PHONE_DETECTOR_ONNX_PATH, REID_MODEL_PATH, ACTION_MODEL_PATH)
+            for path in (POSE_ONNX_PATH, PHONE_DETECTOR_ONNX_PATH, REID_MODEL_PATH, ACTION_MODEL_PATH)
         )
         self.device = torch.device('cpu' if self.using_om_models else ('cuda' if torch.cuda.is_available() else 'cpu'))
         yolo_cuda_available = False
@@ -65,14 +64,11 @@ class VisionAnalysisService:
                 yolo_cuda_available = False
         self.yolo_device = 'cpu' if self.using_om_models else (0 if (self.device.type == 'cuda' or yolo_cuda_available) else 'cpu')
         print(f">>> 行为识别模型将使用设备: {self.device}")
-        self.detector_path = DETECTOR_ONNX_PATH
         self.pose_path = POSE_ONNX_PATH
         
         print(">>> 加载 YOLO & Pose 模型...")
         
-        self.person_detector = create_yolo_model(self.detector_path, task='detect') 
         self.phone_detector = create_yolo_model(PHONE_DETECTOR_ONNX_PATH, task='detect')
-        self.pose_estimator = create_yolo_model(self.pose_path, task='pose')
         
         # [新增] 初始化共享的 ReID 特征提取模型 (只加载一次，节省显存并避免配置冲突)
         print(">>> 加载 ReID 特征提取模型 (共享)...")
@@ -453,13 +449,13 @@ class VisionAnalysisService:
             if camera_id not in self.camera_states:
                 self.camera_states[camera_id] = {
                     # [新增] 为每个相机初始化独立的检测器
-                    'detector': create_yolo_model(self.detector_path, task='detect'),
+                    'detector': create_yolo_model(self.pose_path, task='pose'),
                     
                     'reidentifier': PersonReidentifier(
                         identity_folder=self.identity_folder,
                         known_similarity_threshold=0.9,
                         unknown_similarity_threshold=0.9,
-                        pose_estimator=self.pose_estimator,
+                        pose_estimator=None,
                         feature_extractor=self.shared_reid_extractor, # [修改] 传入共享模型
                         id_generator=self._generate_next_global_id,   # [新增] 传入全局
                         shared_identity_store=self.shared_identity_store,
@@ -561,6 +557,9 @@ class VisionAnalysisService:
                 results = detector.predict(frame, verbose=False, classes=[0], conf=0.5, device=self.yolo_device)
 
         boxes = results[0].boxes.xyxy.cpu().numpy()
+        pose_keypoints = None
+        if results[0].keypoints is not None:
+            pose_keypoints = results[0].keypoints.data.cpu().numpy()
         has_person = len(boxes) > 0
 
         if not has_person:
@@ -682,15 +681,11 @@ class VisionAnalysisService:
             posture = "Unknown"
             keypoint_type = "box_bottom"
 
-            if enable_face or enable_positioning:
-                with profiler.section("9_Pose_Estimation"):
-                    pose_results = self.pose_estimator(base_crop.copy(), verbose=False, conf=0.7, device=self.yolo_device)
-                    if pose_results and len(pose_results[0].keypoints.data) > 0:
-                        kp_data = pose_results[0].keypoints.data[0].cpu().numpy()
-                        detected_kp_count = int(np.sum(kp_data[:, 2] > 0.5))
-                        keypoints_global = kp_data.copy()
-                        keypoints_global[:, 0] += crop_x1
-                        keypoints_global[:, 1] += crop_y1
+            if pose_keypoints is not None and current_idx < len(pose_keypoints):
+                kp_data = pose_keypoints[current_idx]
+                detected_kp_count = int(np.sum(kp_data[:, 2] > 0.5))
+                if detected_kp_count > 0:
+                    keypoints_global = kp_data.copy()
 
             if enable_face:
                 profiler.start("10_Face_Recognition")
@@ -804,7 +799,7 @@ class VisionAnalysisService:
                 if keypoints_global is not None:
                     posture, _ = classify_posture_with_verification(keypoints_global, camera_params, ratio_threshold=0.7)
                     world_coords, keypoint_type, _ = get_world_coords_from_pose(posture, keypoints_global, camera_params)
-                else:
+                if world_coords is None:
                     reference_point = ((x1 + x2) / 2, y2)
                     world_coords = image_to_world_plane(reference_point, camera_params, assumed_height=0.0)
                     keypoint_type = "box_bottom"
