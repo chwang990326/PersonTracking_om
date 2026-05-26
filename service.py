@@ -461,7 +461,7 @@ class VisionAnalysisService:
                         identity_folder=self.identity_folder,
                         known_similarity_threshold=0.9,
                         unknown_similarity_threshold=0.9,
-                        pose_estimator=None,
+                        pose_estimator=self.pose_estimator,
                         feature_extractor=self.shared_reid_extractor,
                         id_generator=self._generate_next_global_id,
                         shared_identity_store=self.shared_identity_store,

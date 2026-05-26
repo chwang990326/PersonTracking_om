@@ -249,54 +249,32 @@ class PersonReidentifier:
     def _get_unknown_gallery_features(self, person_id):
         """
         获取未知身份库中指定ID的特征向量。
+        Redis 模式下不支持直接获取原始特征，返回 None。
         """
-        if self.shared_unknown_store is None:
-            return None
-        with self.shared_unknown_store.lock:
-            return self.shared_unknown_store.reid_feature_gallery.get(person_id)
+        return None
 
     def _unknown_gallery_items_snapshot(self):
         """
         获取未知身份库的快照列表，格式为 [(person_id, features), ...]。
+        Redis 模式下不支持本地快照，返回空列表。
         """
-        if self.shared_unknown_store is None:
-            return []
-        with self.shared_unknown_store.lock:
-            return list(self.shared_unknown_store.reid_feature_gallery.items())
+        return []
 
     def _append_unknown_gallery_file_entry(self, person_id, filename, feature_vector):
         """
-        将一个新的特征向量添加到未知身份库中指定ID的条目下。
-        如果该ID不存在，则创建一个新的条目；
-        如果存在，则将特征向量追加到现有的特征矩阵中，并记录文件名。
+        将新特征写入未知身份库。
+        Redis 模式下，样本已在 add_unknown_reid_sample 中写入，此处仅 touch 续期。
         """
         if self.shared_unknown_store is None:
             return
-        current_feat = feature_vector.reshape(1, -1)
-        with self.shared_unknown_store.lock:
-            if person_id not in self.shared_unknown_store.reid_feature_gallery:
-                self.shared_unknown_store.reid_feature_gallery[person_id] = current_feat
-                self.shared_unknown_store.reid_gallery_files[person_id] = [filename]
-            else:
-                self.shared_unknown_store.reid_feature_gallery[person_id] = np.vstack((
-                    self.shared_unknown_store.reid_feature_gallery[person_id], current_feat
-                ))
-                self.shared_unknown_store.reid_gallery_files.setdefault(person_id, []).append(filename)
-            self.shared_unknown_store.touch_entity(person_id)
+        self.shared_unknown_store.touch_entity(person_id)
 
     def _remove_unknown_gallery_file_entry(self, person_id, filename):
-        if self.shared_unknown_store is None:
-            return False
-        with self.shared_unknown_store.lock:
-            return self._remove_feature_entry(
-                self.shared_unknown_store.reid_feature_gallery,
-                self.shared_unknown_store.reid_gallery_files,
-                person_id,
-                filename,
-            )
+        """Redis 模式下由 release_unknown / release_if_empty 管理，本地无需操作。"""
+        return False
 
     def _find_best_unknown_match(self, feature):
-        # 优先使用 Redis 中央记忆库
+        """使用 Redis 中央记忆库检索 unknown ReID。"""
         if self.redis_memory is not None and self.redis_memory.available:
             try:
                 unknown_id, similarity = self.redis_memory.search_unknown_reid(
@@ -306,18 +284,9 @@ class PersonReidentifier:
                     return unknown_id, similarity
                 return None, 0.0
             except Exception as e:
-                print(f"[ReID] Redis 搜索 unknown_reid 失败，回退到本地: {e}")
+                print(f"[ReID] Redis 搜索 unknown_reid 失败: {e}")
 
-        # 本地 fallback
-        best_match_id = None
-        best_similarity = 0.0
-        for person_id, gallery_features in self._unknown_gallery_items_snapshot():
-            similarity = self._compute_similarity(feature, gallery_features)
-            if similarity >= self.unknown_similarity_threshold and similarity > best_similarity:
-                best_match_id = person_id
-                best_similarity = similarity
-
-        return best_match_id, best_similarity
+        return None, 0.0
 
     def _append_gallery_file_entry(self, person_id, filename, feature_vector, is_anchor=False):
         current_feat = feature_vector.reshape(1, -1)
@@ -949,14 +918,8 @@ class PersonReidentifier:
                     return False
             except Exception:
                 pass
-        else:
-            current_features = self._get_unknown_gallery_features(person_id)
-            if current_features is not None and len(current_features) > 0:
-                sim = self._compute_similarity(feature_vec, current_features)
-                if sim > self.TEMP_ID_DEDUP_THRESHOLD:
-                    return False
 
-        # 写入 Redis 中央记忆库
+        # 写入 Redis 中央记忆库（内部已包含 touch/续期）
         if self.redis_memory is not None and self.redis_memory.available:
             try:
                 self.redis_memory.add_unknown_reid_sample(int(person_id), feature_vec)
@@ -964,10 +927,6 @@ class PersonReidentifier:
                 print(f"[ReID] Redis 写入 unknown_reid 失败: {e}")
                 return False
 
-        # 更新本地缓存
-        self._append_unknown_gallery_file_entry(
-            person_id, f"reid_{int(time.time())}", feature_vec
-        )
         return True
 
     def _check_upper_body_quality(self, image, require_face=True):
