@@ -236,6 +236,8 @@ class AscendYOLO:
         self.input_size = input_size
         self.session = AscendInferSession(model_path)
         self.tracker = None
+        self._debug_output_printed = False
+        self._debug_pose_decode_printed = False
 
     def __call__(self, source, *args, **kwargs):
         return self.predict(source, *args, **kwargs)
@@ -260,6 +262,16 @@ class AscendYOLO:
         blob, ratio, pad = self._preprocess(image)
         outputs = self.session.infer(blob)
         pred = _prepare_prediction(outputs[0])
+        if self.task == "pose" and not self._debug_output_printed:
+            output_shapes = [np.asarray(output).shape for output in outputs]
+            first4_min = np.nanmin(pred[:, :4], axis=0).tolist() if pred.size and pred.shape[1] >= 4 else []
+            first4_max = np.nanmax(pred[:, :4], axis=0).tolist() if pred.size and pred.shape[1] >= 4 else []
+            print(
+                f"[AscendYOLO] pose raw outputs model={self.model_path} "
+                f"shapes={output_shapes} prepared_shape={pred.shape} "
+                f"first4_min={first4_min} first4_max={first4_max}"
+            )
+            self._debug_output_printed = True
         class_filter = _normalize_classes(classes)
 
         if self.task == "pose":
@@ -394,11 +406,23 @@ class AscendYOLO:
 
         num_keypoints = 17
         keypoint_values = num_keypoints * 3
-        num_classes = max(1, pred.shape[1] - 4 - keypoint_values)
-        class_scores = _sigmoid_if_needed(pred[:, 4 : 4 + num_classes])
-        cls_ids = class_scores.argmax(axis=1)
-        scores = class_scores[np.arange(len(class_scores)), cls_ids]
-        kpt_start = 4 + num_classes
+        attrs = pred.shape[1]
+        if attrs == 4 + 1 + keypoint_values:
+            scores = _sigmoid_if_needed(pred[:, 4])
+            cls_ids = np.zeros((pred.shape[0],), dtype=np.int64)
+            kpt_start = 5
+        elif attrs >= 4 + 2 + keypoint_values:
+            num_classes = attrs - 4 - keypoint_values - 1
+            obj = _sigmoid_if_needed(pred[:, 4])
+            class_scores = _sigmoid_if_needed(pred[:, 5 : 5 + num_classes])
+            cls_ids = class_scores.argmax(axis=1)
+            scores = obj * class_scores[np.arange(len(class_scores)), cls_ids]
+            kpt_start = 5 + num_classes
+        else:
+            return AscendResult(
+                AscendBoxes(np.empty((0, 4), dtype=np.float32)),
+                AscendKeypoints(np.empty((0, 17, 3), dtype=np.float32)),
+            )
 
         raw_boxes = pred[:, :4].copy()
         if raw_boxes.size and np.nanmax(raw_boxes) <= 2.0:
@@ -417,6 +441,28 @@ class AscendYOLO:
         xywh_score = _box_contains_points_score(xywh_boxes, point_boxes, point_valid)
         xyxy_score = _box_contains_points_score(xyxy_boxes, point_boxes, point_valid)
         boxes = xyxy_boxes if xyxy_score > xywh_score else xywh_boxes
+        if not self._debug_pose_decode_printed:
+            top_idx = int(np.argmax(scores)) if scores.size else -1
+            if top_idx >= 0:
+                kpts = keypoints[top_idx]
+                visible = kpts[:, 2] > 0.3
+                kpt_range = None
+                if np.any(visible):
+                    kpt_range = {
+                        "x": [float(np.min(kpts[visible, 0])), float(np.max(kpts[visible, 0]))],
+                        "y": [float(np.min(kpts[visible, 1])), float(np.max(kpts[visible, 1]))],
+                    }
+                print(
+                    "[AscendYOLO] pose decode "
+                    f"attrs={attrs} score_max={float(scores[top_idx]):.4f} "
+                    f"score_count_ge_conf={int(np.sum(scores >= conf_thres))} "
+                    f"top_raw_box={raw_boxes[top_idx].tolist()} "
+                    f"top_xywh_box={xywh_boxes[top_idx].tolist()} "
+                    f"top_xyxy_box={xyxy_boxes[top_idx].tolist()} "
+                    f"selected={'xyxy' if xyxy_score > xywh_score else 'xywh'} "
+                    f"kpt_range={kpt_range}"
+                )
+            self._debug_pose_decode_printed = True
 
         mask = scores >= conf_thres
         boxes = boxes[mask]
