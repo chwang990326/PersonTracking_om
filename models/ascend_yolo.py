@@ -246,27 +246,52 @@ class AscendYOLO:
         boxes = result.boxes.xyxy.numpy()
         conf = result.boxes.conf.numpy()
         cls = result.boxes.cls.numpy()
+        keypoints = None
+        if result.keypoints is not None:
+            keypoints = result.keypoints.data.numpy()
         if len(boxes) == 0:
             tracked = self.tracker.update(np.empty((0, 5), dtype=np.float32))
-            return [AscendResult(AscendBoxes(np.empty((0, 4), dtype=np.float32), ids=np.empty((0,), dtype=np.int64)))]
+            return [
+                AscendResult(
+                    AscendBoxes(np.empty((0, 4), dtype=np.float32), ids=np.empty((0,), dtype=np.int64)),
+                    AscendKeypoints(np.empty((0, 17, 3), dtype=np.float32)) if keypoints is not None else None,
+                )
+            ]
 
         dets = np.concatenate([boxes, conf.reshape(-1, 1)], axis=1).astype(np.float32)
         tracked = self.tracker.update(dets)
         if tracked.size == 0:
-            return [AscendResult(AscendBoxes(np.empty((0, 4), dtype=np.float32), ids=np.empty((0,), dtype=np.int64)))]
+            return [
+                AscendResult(
+                    AscendBoxes(np.empty((0, 4), dtype=np.float32), ids=np.empty((0,), dtype=np.int64)),
+                    AscendKeypoints(np.empty((0, 17, 3), dtype=np.float32)) if keypoints is not None else None,
+                )
+            ]
 
         tracked_boxes = tracked[:, :4].astype(np.float32)
         tracked_ids = tracked[:, 4].astype(np.int64)
         matched_conf = np.zeros((len(tracked_boxes),), dtype=np.float32)
         matched_cls = np.zeros((len(tracked_boxes),), dtype=np.float32)
+        matched_keypoints = (
+            np.zeros((len(tracked_boxes), 17, 3), dtype=np.float32)
+            if keypoints is not None
+            else None
+        )
         for index, tracked_box in enumerate(tracked_boxes):
             ious = _box_iou(tracked_box, boxes)
             if ious.size > 0:
                 best = int(np.argmax(ious))
                 matched_conf[index] = conf[best]
                 matched_cls[index] = cls[best]
+                if matched_keypoints is not None:
+                    matched_keypoints[index] = keypoints[best]
 
-        return [AscendResult(AscendBoxes(tracked_boxes, matched_conf, matched_cls, tracked_ids))]
+        return [
+            AscendResult(
+                AscendBoxes(tracked_boxes, matched_conf, matched_cls, tracked_ids),
+                AscendKeypoints(matched_keypoints) if matched_keypoints is not None else None,
+            )
+        ]
 
     @staticmethod
     def _create_tracker():
