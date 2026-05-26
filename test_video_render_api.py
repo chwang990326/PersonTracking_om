@@ -83,7 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="HTTP timeout seconds")
     parser.add_argument("--max-requests", type=int, default=0, help="Stop after N requests; 0 means full video")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for output video and JSON")
-    parser.add_argument("--output-fps", type=float, default=DEFAULT_OUTPUT_FPS, help="FPS of annotated output video")
+    parser.add_argument(
+        "--output-fps",
+        type=float,
+        default=0.0,
+        help="FPS of annotated output video. Default follows --target-fps.",
+    )
     parser.add_argument("--jpeg-quality", type=int, default=DEFAULT_JPEG_QUALITY, help="JPEG quality for requests")
     parser.add_argument(
         "--local-pose-conf",
@@ -188,6 +193,26 @@ def xywh_to_xyxy(bbox: Any) -> Optional[np.ndarray]:
     return np.array([x, y, x + width, y + height], dtype=np.float32)
 
 
+def person_position_box_xyxy(person: Dict[str, Any]) -> Optional[np.ndarray]:
+    anchors = person.get("bbox_anchor_points")
+    if isinstance(anchors, dict):
+        top_left = anchors.get("top_left")
+        bottom_right = anchors.get("bottom_right")
+        if (
+            isinstance(top_left, (list, tuple)) and len(top_left) >= 2 and
+            isinstance(bottom_right, (list, tuple)) and len(bottom_right) >= 2
+        ):
+            try:
+                x1, y1 = float(top_left[0]), float(top_left[1])
+                x2, y2 = float(bottom_right[0]), float(bottom_right[1])
+                if x2 > x1 and y2 > y1:
+                    return np.array([x1, y1, x2, y2], dtype=np.float32)
+            except (TypeError, ValueError):
+                pass
+
+    return xywh_to_xyxy(person.get("bounding_box"))
+
+
 def box_iou(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
     if boxes.size == 0:
         return np.empty((0,), dtype=np.float32)
@@ -259,7 +284,7 @@ def attach_local_pose_to_persons(
     pose_boxes = np.stack([item["box"] for item in pose_items]).astype(np.float32)
     used_pose_indexes = set()
     for person in persons:
-        person_box = xywh_to_xyxy(person.get("bounding_box"))
+        person_box = person_position_box_xyxy(person)
         if person_box is None:
             continue
 
@@ -372,13 +397,11 @@ def draw_anchor_points(frame: Any, anchors: Dict[str, Any], color: Tuple[int, in
 
 
 def draw_person(frame: Any, person: Dict[str, Any], index: int) -> None:
-    bbox = person.get("bounding_box") or []
-    if len(bbox) != 4:
+    box = person_position_box_xyxy(person)
+    if box is None:
         return
 
-    x, y, width, height = bbox
-    x1, y1 = safe_int(x), safe_int(y)
-    x2, y2 = safe_int(float(x) + float(width)), safe_int(float(y) + float(height))
+    x1, y1, x2, y2 = [safe_int(value) for value in box]
     color = color_for_index(index)
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -464,6 +487,7 @@ def main() -> None:
         effective_target_fps = float(args.target_fps)
         interval_sec = 1.0 / effective_target_fps
     frame_step = max(1, int(round(source_fps * interval_sec)))
+    output_fps = float(args.output_fps) if args.output_fps > 0 else effective_target_fps
 
     run_name = f"test1_5fps_render_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.output_dir) / run_name
@@ -472,7 +496,7 @@ def main() -> None:
     output_json_path = run_dir / "responses.json"
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_video_path), fourcc, args.output_fps, (width, height))
+    writer = cv2.VideoWriter(str(output_video_path), fourcc, output_fps, (width, height))
     if not writer.isOpened():
         cap.release()
         raise RuntimeError(f"Failed to create output video: {output_video_path}")
@@ -490,6 +514,7 @@ def main() -> None:
     print(f"camera_id={args.camera_id}")
     print(f"source_fps={source_fps:.3f}")
     print(f"target_fps={effective_target_fps:.3f}")
+    print(f"output_fps={output_fps:.3f}")
     print(f"interval_sec={interval_sec:.3f}")
     print(f"frame_step={frame_step}")
     print(f"output_video={output_video_path}")
@@ -576,6 +601,7 @@ def main() -> None:
                 "api_url": args.api_url,
                 "camera_id": args.camera_id,
                 "target_fps": effective_target_fps,
+                "output_fps": output_fps,
                 "interval_sec": interval_sec,
                 "frame_step": frame_step,
                 "output_video": str(output_video_path),
