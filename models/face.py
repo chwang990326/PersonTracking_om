@@ -37,14 +37,15 @@ class FaceRecognizer:
     4. 通过FAISS进行快速相似度匹配
     """
     
-    def __init__(self, 
+    def __init__(self,
                  face_gallery_path='faceImage',
                  scrfd_model_path='weights/det_10_640.om',
                  adaface_model_path='weights/adaface_ir50_ms1mv2_b1.om',
                  architecture='ir_50',
                  similarity_threshold=0.35,
                  detection_threshold=0.5,
-                 db_path='./database/face_database'):
+                 db_path='./database/face_database',
+                 redis_memory=None):
         """
         初始化SCRFD+AdaFace人脸识别系统。
 
@@ -56,14 +57,16 @@ class FaceRecognizer:
             similarity_threshold (float): 人脸识别相似度阈值，范围[0, 1]。
             detection_threshold (float): 人脸检测置信度阈值，范围[0, 1]。
             db_path (str): FAISS数据库存储路径
+            redis_memory: RedisIdentityMemory 实例（可选）
         """
         print("[FaceRecognizer] 初始化SCRFD+AdaFace人脸识别系统...")
-        
+
         # 保存配置参数
         self.face_gallery_path = face_gallery_path
         self.similarity_threshold = similarity_threshold
         self.detection_threshold = detection_threshold
         self.db_path = db_path
+        self.redis_memory = redis_memory
         scrfd_model_path = resolve_model_path('weights/det_10_640.om', scrfd_model_path)
         adaface_model_path = resolve_model_path('weights/adaface_ir50_ms1mv2_b1.om', adaface_model_path)
         
@@ -118,10 +121,11 @@ class FaceRecognizer:
         print(f"[FaceRecognizer] 从人脸库加载已知人脸: {self.face_gallery_path}")
         
         loaded_count = 0
-        
+        redis_entries = []
+
         for person_id in os.listdir(self.face_gallery_path):
             person_dir = os.path.join(self.face_gallery_path, person_id)
-            
+
             if not os.path.isdir(person_dir):
                 continue
 
@@ -138,23 +142,39 @@ class FaceRecognizer:
 
                     # 使用SCRFD检测人脸
                     bboxes, kpss = self.detector.detect(image, max_num=1)
-                    
+
                     if len(kpss) == 0:
                         print(f"[FaceRecognizer] 警告: 在 {img_path} 中未检测到人脸")
                         continue
 
                     # 使用AdaFace提取人脸特征向量
                     embedding = self.recognizer.get_embedding(image, kpss[0])
-                    
-                    # 将特征向量添加到FAISS数据库
+
+                    # 将特征向量添加到FAISS数据库（本地备份）
                     self.face_db.add_face(embedding, person_id)
                     loaded_count += 1
-                    
+
+                    # 收集用于 Redis 导入
+                    redis_entries.append({
+                        "person_id": str(person_id),
+                        "embedding": embedding.copy(),
+                        "filename": img_file,
+                    })
+
                 except Exception as e:
                     print(f"[FaceRecognizer] 错误: 处理 {img_path} 时出错: {e}")
                     continue
 
         print(f"[FaceRecognizer] 成功加载 {loaded_count} 个人脸特征")
+
+        # 导入到 Redis 中央身份记忆库
+        if self.redis_memory is not None and self.redis_memory.available and redis_entries:
+            try:
+                imported = self.redis_memory.import_known_faces(redis_entries)
+                if imported > 0:
+                    print(f"[FaceRecognizer] 已导入 {imported} 条 known_face 特征到 Redis")
+            except Exception as e:
+                print(f"[FaceRecognizer] Redis 导入 known_face 失败: {e}")
 
     def detect_and_recognize(self, face_detector, frame, person_crop, crop_x1, crop_y1):
         """
@@ -187,9 +207,18 @@ class FaceRecognizer:
                 try:
                     # 使用AdaFace提取人脸特征向量
                     embedding = self.recognizer.get_embedding(person_crop, kps)
-                    
-                    # 在FAISS数据库中搜索最匹配的已知人脸
-                    person_id, similarity = self.face_db.search(embedding, self.similarity_threshold)
+
+                    # 检索：优先 Redis，fallback 到本地 FAISS
+                    person_id = 'Unknown'
+                    similarity = 0.0
+                    if self.redis_memory is not None and self.redis_memory.available:
+                        pid, sim = self.redis_memory.search_known_face(
+                            embedding, self.similarity_threshold
+                        )
+                        person_id = pid if pid is not None else 'Unknown'
+                        similarity = sim
+                    else:
+                        person_id, similarity = self.face_db.search(embedding, self.similarity_threshold)
                     face_ids.append(person_id)
                     
                     # 将相对坐标转换为全局坐标
