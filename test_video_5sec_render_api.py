@@ -24,8 +24,8 @@ import numpy as np
 import requests
 
 
-DEFAULT_VIDEO_PATH = "/video/test2.mp4"
-DEFAULT_FALLBACK_VIDEO_PATH = "video/test2.mp4"
+DEFAULT_VIDEO_PATH = "/video/NVR_ch3_main_wang_climing.mp4"
+DEFAULT_FALLBACK_VIDEO_PATH = "video/NVR_ch3_main_wang_climing.mp4"
 DEFAULT_API_URL = "http://192.168.100.64:8130/api/v1/person/detect"
 DEFAULT_CAMERA_ID = "203"
 DEFAULT_INTERVAL_SECONDS = 5.0
