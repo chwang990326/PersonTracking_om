@@ -86,6 +86,7 @@ class VisionAnalysisService:
         print(">>> 加载 YOLO & Pose 模型...")
 
         self.phone_detector = create_yolo_model(PHONE_DETECTOR_ONNX_PATH, task='detect')
+        self.pose_estimator = create_yolo_model(POSE_ONNX_PATH, task='pose')
 
         # 初始化共享的 ReID 特征提取模型
         print(">>> 加载 ReID 特征提取模型 (共享)...")
