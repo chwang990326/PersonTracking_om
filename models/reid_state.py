@@ -8,9 +8,10 @@ import cv2
 class SharedIdentityStore:
     """Service-level shared gallery state for all camera-local reidentifiers."""
 
-    def __init__(self, identity_folder, feature_extractor):
+    def __init__(self, identity_folder, feature_extractor, redis_memory=None):
         self.identity_folder = identity_folder
         self.feature_extractor = feature_extractor
+        self.redis_memory = redis_memory
         self.lock = threading.RLock()
         self.feature_gallery = {}
         self.anchor_gallery = {}
@@ -136,6 +137,36 @@ class SharedIdentityStore:
             self.anchor_files.update(anchor_files)
             self._last_signature = signature
 
+    @staticmethod
+    def _build_redis_import_entries(gallery, anchor_gallery, gallery_files, anchor_files):
+        """构建 Redis import_known_reid 所需的 entries 列表。"""
+        entries = []
+        for person_id, features in gallery.items():
+            filenames = gallery_files.get(person_id, [])
+            anchor_filenames = set(anchor_files.get(person_id, []))
+            for idx, feature in enumerate(features):
+                filename = filenames[idx] if idx < len(filenames) else f"sample_{idx}"
+                entries.append({
+                    "person_id": str(person_id),
+                    "embedding": feature,
+                    "filename": filename,
+                    "is_anchor": filename in anchor_filenames,
+                })
+        return entries
+
+    def _import_to_redis(self, gallery, anchor_gallery, gallery_files, anchor_files):
+        if self.redis_memory is None or not self.redis_memory.available:
+            return
+        try:
+            entries = self._build_redis_import_entries(
+                gallery, anchor_gallery, gallery_files, anchor_files
+            )
+            imported = self.redis_memory.import_known_reid(entries)
+            if imported > 0:
+                print(f"[ReID] 已导入 {imported} 条 known_reid 特征到 Redis")
+        except Exception as e:
+            print(f"[ReID] Redis 导入 known_reid 失败: {e}")
+
     def reload(self, verbose=True):
         entries = self.scan_identity_entries(self.identity_folder)
         signature = self.signature_from_entries(entries)
@@ -150,6 +181,8 @@ class SharedIdentityStore:
             print("[ReID] 警告: 特征画廊为空，将无法识别任何人。请检查'identity'文件夹结构。")
         elif verbose:
             print(f"[ReID] 特征画廊构建完成，共包含 {len(gallery)} 个已知身份。")
+
+        self._import_to_redis(gallery, anchor_gallery, gallery_files, anchor_files)
         return True
 
     def refresh_if_changed(self, verbose=True):
@@ -170,4 +203,6 @@ class SharedIdentityStore:
             print("[ReID] 警告: 特征画廊为空，将无法识别任何人。请检查'identity'文件夹结构。")
         elif verbose:
             print(f"[ReID] identity 库变更，已热更新特征画廊，共包含 {len(gallery)} 个已知身份。")
+
+        self._import_to_redis(gallery, anchor_gallery, gallery_files, anchor_files)
         return True

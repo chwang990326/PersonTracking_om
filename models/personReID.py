@@ -3,9 +3,6 @@ import cv2
 import numpy as np
 import torch
 import threading
-from datetime import datetime
-from collections import deque
-import shutil
 import time
 from models.personvit_adapter import PersonViTFeatureExtractor
 from models.reid_state import SharedIdentityStore
@@ -18,11 +15,10 @@ class PersonReidentifier:
     基于预定义的身份库（Gallery）进行人物重识别。
     """
 
-    def __init__(self, identity_folder='identity', 
+    def __init__(self, identity_folder='identity',
                  model_path='weights/transformer_120_16.om',
-                 # config_file='models/transreid_pytorch/configs/msmt17/vit_base_ics_384.yml',
                  config_file='./models/transreid_pytorch/configs/market/vit_base.yml',
-                 similarity_threshold=0.9, 
+                 similarity_threshold=0.9,
                  known_similarity_threshold=None,
                  unknown_similarity_threshold=None,
                  device='cuda', max_age=30, iou_threshold=0.3, feature_smooth_alpha=0.8,
@@ -30,13 +26,13 @@ class PersonReidentifier:
                  feature_extractor=None,
                  id_generator=None,
                  shared_identity_store=None,
-                 shared_unknown_store=None): 
+                 shared_unknown_store=None,
+                 redis_memory=None):
         """
         初始化ReID系统。
 
         参数:
             identity_folder (str): 存放已知人物图片的根文件夹。
-            model_name (str): 使用的torchreid模型名称。
             similarity_threshold (float): 兼容旧调用的统一相似度阈值别名。
             known_similarity_threshold (float): 已知人员 ReID 匹配阈值。
             unknown_similarity_threshold (float): 未知人员 ReID 匹配阈值。
@@ -47,6 +43,7 @@ class PersonReidentifier:
             pose_estimator: YOLO姿态估计器实例，用于验证图像质量
             verify_interval (int): 身份校验间隔帧数，用于纠正追踪过程中的身份错误
             id_generator (callable): 全局唯一的ID生成函数，返回下一个可用的临时ID
+            redis_memory: RedisIdentityMemory 实例（可选，有则使用 Redis 中央记忆）
         """
         print("[ReID] 初始化系统...")
         if not os.path.exists(model_path):
@@ -96,31 +93,15 @@ class PersonReidentifier:
         self.gallery_lock = threading.RLock()
         self.shared_identity_store = shared_identity_store
         self.shared_unknown_store = shared_unknown_store
-        
-        # 定义临时ID范围
-        self.TEMP_ID_START = 0
-        self.TEMP_ID_END = 99 # 扩大一点范围
-        
-        # 启动时清理过期档案
-        self._cleanup_temp_identities(max_days=1) 
+        self.redis_memory = redis_memory
 
-        # [修改] ID生成策略：优先使用外部传入的生成器（全局唯一），否则使用本地逻辑
+        # ID生成策略：优先使用外部传入的生成器（全局唯一），否则使用本地逻辑
         self.id_generator = id_generator
 
         if self.id_generator is None:
-            # 初始化自动ID生成器 (本地逻辑，仅用于单机单摄场景)
-            max_existing_id = self.TEMP_ID_START - 1
-            if os.path.exists(self.identity_folder):
-                for d in os.listdir(self.identity_folder):
-                    if d.isdigit():
-                        did = int(d)
-                        if self.TEMP_ID_START <= did <= self.TEMP_ID_END:
-                            max_existing_id = max(max_existing_id, did)
-            
-            self.next_auto_id = max_existing_id + 1
-            if self.next_auto_id > self.TEMP_ID_END:
-                self.next_auto_id = self.TEMP_ID_START
-            print(f"[ReID] (本地模式) 临时ID范围: {self.TEMP_ID_START}-{self.TEMP_ID_END}, 当前起始: {self.next_auto_id}")
+            # 本地 fallback: 使用简单的自增计数器（不再扫描文件系统）
+            self._local_id_counter = 1
+            print(f"[ReID] (本地模式) 使用本地自增 ID 计数器（不扫描 identity 目录）")
         else:
             print(f"[ReID] (全局模式) 使用外部共享的ID生成器")
 
@@ -181,9 +162,21 @@ class PersonReidentifier:
 
     def _is_temporary_identity(self, person_id):
         person_id = self._normalize_identity_value(person_id)
-        return isinstance(person_id, int) or (
-            isinstance(person_id, str) and person_id.isdigit()
-        )
+        if person_id in (None, '', -1):
+            return False
+        if isinstance(person_id, int):
+            return True
+        if isinstance(person_id, str):
+            # 数字字符串（兼容旧数据）
+            if person_id.isdigit():
+                return True
+            # unknown:UUID (如 unknown:a1b2c3d4...)
+            if person_id.startswith("unknown:"):
+                return True
+            # 纯 UUID hex（兼容旧格式）
+            if len(person_id) == 32 and all(c in '0123456789abcdef' for c in person_id):
+                return True
+        return False
 
     def _is_known_identity(self, person_id):
         person_id = self._normalize_identity_value(person_id)
@@ -196,16 +189,14 @@ class PersonReidentifier:
 
     def _allocate_temporary_id(self):
         """
-        分配一个全局唯一的临时ID，优先使用外部生成器，如果没有则使用本地逻辑。
+        分配一个全局唯一的临时ID（UUID），优先使用外部生成器（Redis），
+        否则使用本地 uuid4。
         """
         if self.id_generator:
             return self.id_generator()
 
-        temp_id = self.next_auto_id
-        self.next_auto_id += 1
-        if hasattr(self, 'TEMP_ID_END') and self.next_auto_id > self.TEMP_ID_END:
-            self.next_auto_id = self.TEMP_ID_START
-        return temp_id
+        import uuid
+        return f"unknown:{uuid.uuid4().hex}"
 
     def refresh_track_state(self, active_track_ids):
         """
@@ -247,20 +238,6 @@ class PersonReidentifier:
             return None
         return frame[y1:y2, x1:x2].copy()
 
-    def _generate_prefixed_filename(self, target_dir, prefix):
-        base_name = datetime.now().strftime(f"{prefix}_%Y%m%d_%H%M%S")
-        filename = f"{base_name}.jpg"
-        save_path = os.path.join(target_dir, filename)
-        suffix = 1
-        while os.path.exists(save_path):
-            filename = f"{base_name}_{suffix}.jpg"
-            save_path = os.path.join(target_dir, filename)
-            suffix += 1
-        return filename
-
-    def _generate_anchor_filename(self, target_dir):
-        return self._generate_prefixed_filename(target_dir, 'anchor')
-
     def _get_gallery_features(self, person_id):
         with self.gallery_lock:
             return self.feature_gallery.get(person_id)
@@ -284,64 +261,44 @@ class PersonReidentifier:
     def _get_unknown_gallery_features(self, person_id):
         """
         获取未知身份库中指定ID的特征向量。
+        Redis 模式下不支持直接获取原始特征，返回 None。
         """
-        if self.shared_unknown_store is None:
-            return None
-        with self.shared_unknown_store.lock:
-            return self.shared_unknown_store.reid_feature_gallery.get(person_id)
+        return None
 
     def _unknown_gallery_items_snapshot(self):
         """
         获取未知身份库的快照列表，格式为 [(person_id, features), ...]。
+        Redis 模式下不支持本地快照，返回空列表。
         """
-        if self.shared_unknown_store is None:
-            return []
-        with self.shared_unknown_store.lock:
-            return list(self.shared_unknown_store.reid_feature_gallery.items())
+        return []
 
     def _append_unknown_gallery_file_entry(self, person_id, filename, feature_vector):
         """
-        将一个新的特征向量添加到未知身份库中指定ID的条目下。
-        如果该ID不存在，则创建一个新的条目；
-        如果存在，则将特征向量追加到现有的特征矩阵中，并记录文件名。
+        将新特征写入未知身份库。
+        Redis 模式下，样本已在 add_unknown_reid_sample 中写入，此处仅 touch 续期。
         """
         if self.shared_unknown_store is None:
             return
-        current_feat = feature_vector.reshape(1, -1)
-        with self.shared_unknown_store.lock:
-            if person_id not in self.shared_unknown_store.reid_feature_gallery:
-                self.shared_unknown_store.reid_feature_gallery[person_id] = current_feat
-                self.shared_unknown_store.reid_gallery_files[person_id] = [filename]
-            else:
-                self.shared_unknown_store.reid_feature_gallery[person_id] = np.vstack((
-                    self.shared_unknown_store.reid_feature_gallery[person_id], current_feat
-                ))
-                self.shared_unknown_store.reid_gallery_files.setdefault(person_id, []).append(filename)
-            self.shared_unknown_store.touch_entity(person_id)
+        self.shared_unknown_store.touch_entity(person_id)
 
     def _remove_unknown_gallery_file_entry(self, person_id, filename):
-        if self.shared_unknown_store is None:
-            return False
-        with self.shared_unknown_store.lock:
-            return self._remove_feature_entry(
-                self.shared_unknown_store.reid_feature_gallery,
-                self.shared_unknown_store.reid_gallery_files,
-                person_id,
-                filename,
-            )
+        """Redis 模式下由 release_unknown / release_if_empty 管理，本地无需操作。"""
+        return False
 
     def _find_best_unknown_match(self, feature):
-        best_match_id = None
-        best_similarity = 0.0
+        """使用 Redis 中央记忆库检索 unknown ReID。"""
+        if self.redis_memory is not None and self.redis_memory.available:
+            try:
+                unknown_id, similarity = self.redis_memory.search_unknown_reid(
+                    feature, self.unknown_similarity_threshold
+                )
+                if unknown_id is not None:
+                    return unknown_id, similarity
+                return None, 0.0
+            except Exception as e:
+                print(f"[ReID] Redis 搜索 unknown_reid 失败: {e}")
 
-        for person_id, gallery_features in self._unknown_gallery_items_snapshot():
-            similarity = self._compute_similarity(feature, gallery_features)
-            if similarity >= self.unknown_similarity_threshold and similarity > best_similarity:
-                best_match_id = person_id
-                best_similarity = similarity
-
-        return best_match_id, best_similarity
-
+        return None, 0.0
 
     def _append_gallery_file_entry(self, person_id, filename, feature_vector, is_anchor=False):
         current_feat = feature_vector.reshape(1, -1)
@@ -523,114 +480,82 @@ class PersonReidentifier:
             return True
         return False
 
-    # --- 新增辅助函数：智能保存图片到Gallery ---
-    # [修改] 增加 force 参数
     def _smart_save_to_gallery(self, person_id, image, feature_vector, force=False):
         """
-        智能保存：
-        force (bool): 是否强制保存（用于人脸识别确认后的高质量图）
+        智能保存已知身份 ReID 特征到 Redis 中央记忆库。
+        force: 是否强制保存（用于人脸识别确认后的高质量图）
+        image 参数保留用于接口兼容，实际不再写盘。
         """
         if not self._is_auto_save_enabled():
             return False
 
-        target_dir = os.path.join(self.identity_folder, str(person_id))
-        
-        # 判断是否为数字ID (临时ID)
-        is_temp_id = str(person_id).isdigit()
-        
-        # --- 策略分支 ---
-        
-        # 1. 如果是临时ID (数字)：保持原有逻辑 (只存1张，不更新)
+        is_temp_id = self._is_temporary_identity(person_id)
+
+        # 临时ID：不保存已知库，只记录即可
         if is_temp_id:
             if not force:
                 if not self._check_temp_identity_dedup(feature_vector, person_id):
                     return False
-                if os.path.exists(target_dir):
-                    existing_files = [f for f in os.listdir(target_dir) if f.lower().endswith(('.jpg', '.png'))]
-                    if len(existing_files) > 0:
+                if self.redis_memory is not None and self.redis_memory.available:
+                    count = self.redis_memory.count_known_samples(str(person_id), "reid")
+                    if count > 0:
                         return False
-        
-        # 2. 如果是已知ID (字符串)：执行换装更新策略
+                elif self._get_gallery_features(person_id) is not None:
+                    return False
+
+        # 已知ID：执行换装更新策略
         else:
             if not force:
-                # [需求2: 普通特征准入] 存在锚点时，必须通过锚点门控防止漂移
                 if not self._check_anchor_gate(person_id, feature_vector):
                     return False
-                
-                # 原有的多样性检查（避免重复保存相似特征）
                 if not self._check_feature_diversity(person_id, feature_vector):
                     return False
-            
-            # [需求3: 双轨制淘汰] 检查容量，仅淘汰普通特征
-            self._manage_gallery_capacity(person_id)
 
-        # --- 公共检查 ---
-        
-        # 关键点质量检查 (上半身完整性)
+            # 容量管理委托给 Redis
+            if self.redis_memory is not None and self.redis_memory.available:
+                pass  # add_known_reid_sample 内部有容量管理
+
+        # 公共质量检查
         if force:
-            # [优化] force 模式仍做最低限度质量检查：尺寸和模糊度
             h, w = image.shape[:2]
             if h < 50 or w < 30:
-                print(f"[ReID] force 保存跳过: 图像尺寸过小 ({w}x{h})")
                 return False
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if blur_score < 30:
-                print(f"[ReID] force 保存跳过: 图像过于模糊 (blur_score={blur_score:.1f})")
+            if cv2.Laplacian(gray, cv2.CV_64F).var() < 30:
                 return False
         else:
-            # 非 force 模式：要求上半身完整
             if not self._check_upper_body_quality(image, require_face=True):
                 return False
 
-        # --- 执行保存 ---
+        # 执行保存（写入 Redis + 更新本地缓存）
         try:
-            os.makedirs(target_dir, exist_ok=True)
-            
-            filename = f"auto_{int(time.time() * 1000)}.jpg"
-            save_path = os.path.join(target_dir, filename)
-            cv2.imwrite(save_path, image)
-            
-            # 更新内存库
-            self._append_gallery_file_entry(person_id, filename, feature_vector, is_anchor=False)
-            
-            current_count = len([f for f in os.listdir(target_dir) if f.lower().endswith(('.jpg', '.png'))])
-            
+            if self.redis_memory is not None and self.redis_memory.available:
+                self.redis_memory.add_known_reid_sample(str(person_id), feature_vector, is_anchor=False)
+
+            # 更新本地内存库（保持本地缓存同步）
+            self._append_gallery_file_entry(person_id, f"auto_{int(time.time() * 1000)}", feature_vector, is_anchor=False)
+
             if not is_temp_id:
-                print(f"[ReID] ID {person_id} 特征库已更新 (换装/新角度), 当前样本数: {current_count}")
+                print(f"[ReID] ID {person_id} 特征已写入 Redis (换装/新角度)")
             else:
-                print(f"[ReID] ID {person_id} 补充新特征 (上半身完整, 当前样本数: {current_count})")
-                
+                print(f"[ReID] ID {person_id} 补充新特征已写入 Redis")
             return True
         except Exception as e:
             print(f"[ReID] 保存失败: {e}")
             return False
 
-    # --- 新增辅助函数：合并身份 ---
     def _merge_identities(self, temp_id, real_id):
         """
         将临时ID的数据合并到真实ID中。
-        [优化] 当人脸识别成功时，我们认为当前帧质量优于之前的临时抓拍。
-        因此，策略改为：清理旧的临时ID数据，为保存当前高质量帧腾出空间。
+        不再涉及文件系统操作，仅合并内存中的特征库。
         """
         print(f"[ReID] 正在合并身份: {temp_id} -> {real_id}")
-        
-        src_dir = os.path.join(self.identity_folder, str(temp_id))
-        
-        # 1. 直接删除旧的临时文件夹
-        if os.path.exists(src_dir):
-            try:
-                shutil.rmtree(src_dir)
-                print(f"[ReID] 已清理临时ID {temp_id} 的旧数据 (将被当前高质量人脸帧替代)")
-            except Exception as e:
-                print(f"[ReID] 删除临时文件夹失败: {e}")
 
-        # 2. 合并内存中的特征库
+        # 合并内存中的特征库
         with self.gallery_lock:
             self._merge_store_entries(self.feature_gallery, self.gallery_files, temp_id, real_id)
             self._merge_store_entries(self.anchor_gallery, self.anchor_files, temp_id, real_id)
-            
-        # [修复] 移除 moved_count，改为简单的完成提示
+
         print(f"[ReID] 身份合并操作完成: {temp_id} -> {real_id}")
 
     def _check_overlap(self, current_idx, all_boxes):
@@ -850,23 +775,33 @@ class PersonReidentifier:
         return assigned_ids, assigned_scores
 
     def _find_best_match_in_gallery(self, feature):
-        """辅助函数：在特征库中寻找最佳匹配"""
+        """辅助函数：在特征库中寻找最佳匹配（优先 Redis）。"""
+        # 动态阈值
+        current_threshold = self.known_similarity_threshold
+        gallery_size = self._gallery_size()
+        if gallery_size > 5:
+            current_threshold += 0.02
+
+        # 优先使用 Redis 中央记忆库
+        if self.redis_memory is not None and self.redis_memory.available:
+            try:
+                person_id, similarity = self.redis_memory.search_known_reid(feature, current_threshold)
+                if person_id is not None:
+                    return person_id, similarity
+                return None, 0.0
+            except Exception as e:
+                print(f"[ReID] Redis 搜索 known_reid 失败，回退到本地: {e}")
+
+        # 本地线性扫描 fallback
         best_match_id = None
         best_similarity = 0.0
-        
         gallery_items = self._gallery_items_snapshot()
         for person_id, gallery_features in gallery_items:
             similarity = self._compute_similarity(feature, gallery_features)
-            
-            # 动态阈值
-            current_threshold = self.known_similarity_threshold
-            if self._gallery_size() > 5: 
-                current_threshold += 0.02
-
             if similarity >= current_threshold and similarity > best_similarity:
                 best_match_id = person_id
                 best_similarity = similarity
-        
+
         return best_match_id, best_similarity
 
     def update_identity(self, track_id, new_person_id, person_crop=None,
@@ -900,7 +835,7 @@ class PersonReidentifier:
             print(f"[ReID] 人脸校准: Track {track_id} ({old_id}) -> {new_person_id}")
             
             # 1. 身份合并 (如果是临时ID -> 真实ID)
-            is_temp_id = isinstance(old_id, int) or (isinstance(old_id, str) and old_id.isdigit())
+            is_temp_id = self._is_temporary_identity(old_id)
             if is_temp_id:
                 self._merge_identities(old_id, new_person_id)
             
@@ -953,7 +888,8 @@ class PersonReidentifier:
 
     def save_unknown_reid_sample(self, track_id, person_id, image, box=None, frame_shape=None, all_boxes=None, current_idx=None):
         """
-        智能保存未知身份的 ReID 样本到共享存储。
+        保存未知身份的 ReID 特征到 Redis 中央记忆库。
+        image 参数保留用于接口兼容和质量检查，实际不再写盘。
         """
         if (
             self.shared_unknown_store is None
@@ -983,66 +919,28 @@ class PersonReidentifier:
             return False
 
         feature_vec = self.track_mapper[track_id]['feature'].copy()
-        current_features = self._get_unknown_gallery_features(person_id)
-        if current_features is not None and len(current_features) > 0:
-            sim = self._compute_similarity(feature_vec, current_features)
-            if sim > self.TEMP_ID_DEDUP_THRESHOLD:
+
+        # 去重：通过 Redis 已有样本检查
+        if self.redis_memory is not None and self.redis_memory.available:
+            try:
+                top_matches = self.redis_memory.search_unknown_reid(
+                    feature_vec, self.TEMP_ID_DEDUP_THRESHOLD, top_k=5
+                )
+                if top_matches[0] is not None and str(top_matches[0]) == str(person_id) and top_matches[1] > self.TEMP_ID_DEDUP_THRESHOLD:
+                    return False
+            except Exception:
+                pass
+
+        # 写入 Redis 中央记忆库（内部已包含 touch/续期）
+        if self.redis_memory is not None and self.redis_memory.available:
+            try:
+                self.redis_memory.add_unknown_reid_sample(str(person_id), feature_vec)
+            except Exception as e:
+                print(f"[ReID] Redis 写入 unknown_reid 失败: {e}")
                 return False
 
-        target_dir = os.path.join(self.shared_unknown_store.reid_folder, str(person_id))
-        os.makedirs(target_dir, exist_ok=True)
-        existing_files = list(self.shared_unknown_store.reid_gallery_files.get(person_id, []))
-        if len(existing_files) >= self.MAX_UNKNOWN_REID_IMAGES:
-            oldest = existing_files[0]
-            oldest_path = os.path.join(target_dir, oldest)
-            if os.path.exists(oldest_path):
-                os.remove(oldest_path)
-            self._remove_unknown_gallery_file_entry(person_id, oldest)
-
-        filename = self._generate_prefixed_filename(target_dir, 'reid')
-        save_path = os.path.join(target_dir, filename)
-        cv2.imwrite(save_path, image)
-        self._append_unknown_gallery_file_entry(person_id, filename, feature_vec)
         return True
 
-    def _cleanup_temp_identities(self, max_days=1):
-        """
-        清理过期的临时档案。
-        
-        参数:
-            max_days (int): 临时档案保留的最大天数。超过这个时间的数字ID文件夹将被删除。
-        """
-        print(f"[ReID] 正在清理超过 {max_days} 天的临时档案...")
-        if not os.path.exists(self.identity_folder):
-            return
-
-        current_time = time.time()
-        deleted_count = 0
-
-        for d in os.listdir(self.identity_folder):
-            dir_path = os.path.join(self.identity_folder, d)
-            
-            # 只清理数字命名的文件夹 (假设这些是自动生成的临时ID)
-            # 且必须是文件夹
-            if os.path.isdir(dir_path) and d.isdigit():
-                # 获取文件夹最后修改时间
-                mtime = os.path.getmtime(dir_path)
-                
-                # 如果超过了保留期限
-                if (current_time - mtime) > (max_days * 24 * 3600):
-                    try:
-                        shutil.rmtree(dir_path) # 递归删除文件夹
-                        deleted_count += 1
-                        # print(f"[ReID] 已删除过期临时档案: {d}")
-                    except Exception as e:
-                        print(f"[ReID] 删除失败 {d}: {e}")
-        
-        if deleted_count > 0:
-            print(f"[ReID] 清理完成，共删除了 {deleted_count} 个过期临时档案。")
-        else:
-            print("[ReID] 没有发现过期的临时档案。")
-    
-    # [新增] 添加关键点质量检查方法
     def _check_upper_body_quality(self, image, require_face=True):
         """
         检查图像是否包含完整的上半身关键点。
@@ -1228,144 +1126,80 @@ class PersonReidentifier:
             return False
         return True
 
-    # --- [需求1] 锚点特征保存 ---
     def _save_anchor_to_gallery(self, person_id, image, feature_vector):
         """
-        [锚点特征管理] 将人脸识别确认的特征作为锚点保存。
+        锚点特征保存到 Redis 中央记忆库。
         执行多样性拦截（>0.95拒绝冗余）和独立容量限制（最多2张）。
+        image 参数保留用于接口兼容和质量检查，实际不再写盘。
         """
         if not self._is_auto_save_enabled():
             return False
 
         person_id = self._normalize_identity_value(person_id)
         if not self._is_known_identity(person_id):
-            print(f"[ReID] 锚点保存跳过: ID {person_id} 不是已知身份。")
             return False
 
-        target_dir = os.path.join(self.identity_folder, str(person_id))
-        
-        # --- 基础质量检查（尺寸和模糊度）---
+        # 基础质量检查（尺寸和模糊度）
         h, w = image.shape[:2]
         if h < 50 or w < 30:
-            print(f"[ReID] 锚点保存跳过: 图像尺寸过小 ({w}x{h})")
             return False
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if blur_score < 30:
-            print(f"[ReID] 锚点保存跳过: 图像过于模糊 (blur_score={blur_score:.1f})")
+        if cv2.Laplacian(gray, cv2.CV_64F).var() < 30:
             return False
-        
-        # --- [需求1: 多样性拦截] 与已有锚点相似度 > 0.95 则属于冗余锚点，拒绝保存 ---
+
+        # 多样性拦截：与已有锚点相似度 > 0.95 则拒绝
         current_anchors = self._get_anchor_features(person_id)
         if current_anchors is not None and len(current_anchors) > 0:
             sim = self._compute_similarity(feature_vector, current_anchors)
             if sim > self.ANCHOR_DIVERSITY_THRESHOLD:
                 print(f"[ReID] 锚点去重拦截: ID {person_id} 相似度 {sim:.3f} > {self.ANCHOR_DIVERSITY_THRESHOLD}，冗余锚点")
                 return False
-        
-        # --- [需求1: 独立容量限制] 最多 MAX_ANCHOR_IMAGES 张，超出删最早的 ---
-        os.makedirs(target_dir, exist_ok=True)
-        existing_anchors = sorted([f for f in os.listdir(target_dir)
-                                   if f.lower().endswith(('.jpg', '.png')) and f.startswith('anchor_')])
-        
-        if len(existing_anchors) >= self.MAX_ANCHOR_IMAGES:
-            oldest = existing_anchors[0]
-            try:
-                os.remove(os.path.join(target_dir, oldest))
-                self._remove_gallery_file_entry(person_id, oldest)
-                print(f"[ReID] 锚点容量轮替: ID {person_id} 删除最早锚点 {oldest}")
-            except Exception as e:
-                print(f"[ReID] 删除旧锚点失败: {e}")
-        
-        # --- 执行保存（使用 anchor_ 前缀与普通特征物理隔离）---
+
+        # 执行保存（写入 Redis + 更新本地缓存）
         try:
-            filename = self._generate_anchor_filename(target_dir)
-            save_path = os.path.join(target_dir, filename)
-            cv2.imwrite(save_path, image)
-            
-            # 更新内存中的锚点库
+            if self.redis_memory is not None and self.redis_memory.available:
+                self.redis_memory.add_known_reid_sample(str(person_id), feature_vector, is_anchor=True)
+
+            filename = f"anchor_{int(time.time())}"
             self._append_gallery_file_entry(person_id, filename, feature_vector, is_anchor=True)
-            
-            anchor_count = len([f for f in os.listdir(target_dir)
-                                 if f.startswith('anchor_') and f.lower().endswith(('.jpg', '.png'))])
-            print(f"[ReID] 锚点保存成功: ID {person_id}，当前锚点数: {anchor_count}")
+
+            print(f"[ReID] 锚点保存成功: ID {person_id}")
             return True
         except Exception as e:
             print(f"[ReID] 锚点保存失败: {e}")
             return False
 
-    # --- [需求3] 双轨制淘汰保护：管理画廊容量 ---
     def _manage_gallery_capacity(self, person_id):
-        """
-        [双轨制淘汰保护] 确保每个人的画廊不会无限膨胀。
-        只淘汰普通特征(auto_前缀)，锚点特征(anchor_前缀)绝对豁免。
-        """
-        target_dir = os.path.join(self.identity_folder, str(person_id))
-        if not os.path.exists(target_dir):
-            return
-
-        files = sorted([f for f in os.listdir(target_dir) if f.lower().endswith(('.jpg', '.png'))])
-        
-        if len(files) <= self.MAX_GALLERY_IMAGES:
-            return
-
-        # 找出所有自动采集的文件 (以 auto_ 开头)
-        auto_files = [f for f in files if f.startswith('auto_')]
-        
-        # 如果有自动采集的文件，按时间戳排序删除最早的
-        if auto_files:
-            # auto_files 已经是按文件名排序的（因为时间戳在文件名里），直接删第一个
-            file_to_remove = auto_files[0]
-            try:
-                os.remove(os.path.join(target_dir, file_to_remove))
-                self._remove_gallery_file_entry(person_id, file_to_remove)
-                print(f"[ReID] ID {person_id} 画廊已满，轮替删除旧样本: {file_to_remove}")
-            except Exception as e:
-                print(f"[ReID] 删除文件失败: {e}")
-        else:
-            # 如果全是人工放的图，通常不删，或者强制删最早的
-            pass
+        """容量管理已委托给 Redis add_known_reid_sample 内部处理。"""
+        pass
 
     def _process_auto_save(self, track_id, person_id, image, feature, box, frame_shape, all_boxes, current_idx):
         """
-        处理自动采集逻辑：
+        处理自动采集逻辑（不再写盘，特征写入 Redis）。
         结合纠错机制（Track Age）、几何约束、重叠检测和姿态质量。
         """
         if not self._is_auto_save_enabled():
             return
 
-        # 1. 纠错机制：必须追踪稳定一定帧数后才采集
         current_age = self.track_mapper[track_id].get('age', 0)
         if current_age < self.MIN_TRACK_AGE:
-            # print(f"[Debug] ID {person_id} (Track {track_id}) 追踪时间不足: {current_age}/{self.MIN_TRACK_AGE}")
             return
 
-        # 2. 临时ID只存1张；已知ID交给 _smart_save_to_gallery 的多样性检查决定
-        is_temp_id = str(person_id).isdigit()
+        # 临时ID只存1张
+        is_temp_id = self._is_temporary_identity(person_id)
         if is_temp_id:
-            target_dir = os.path.join(self.identity_folder, str(person_id))
-            if os.path.exists(target_dir):
-                files = [f for f in os.listdir(target_dir) if f.lower().endswith(('.jpg', '.png'))]
-                if len(files) > 0:
-                    return
+            if self._get_gallery_features(person_id) is not None:
+                return
 
-        # 3. 几何约束检查 (边缘、时间戳、尺寸、比例)
         if not self._check_image_geometry(box, frame_shape):
-            # print(f"[Debug] ID {person_id} 几何检查未通过 (太小/靠边/比例不对)")
             return
-         
-        # 4. 重叠检查 (避免多人重叠)
+
         if self._check_overlap(current_idx, all_boxes):
-            # print(f"[Debug] ID {person_id} 检测到与其他框重叠，跳过")
             return
-        
-        # 5. 姿态质量检查 (强制正面人脸 + 完整上半身)
-        # 必须检测到完整人脸和上半身关节
+
         if not self._check_upper_body_quality(image, require_face=True):
-            # print(f"[Debug] ID {person_id} 姿态质量不达标 (关键点缺失)")
             return
-        
-        # 6. 执行保存
+
         print(f"[ReID] >>> 自动采集成功: ID {person_id} (Track {track_id}) <<<")
         self._smart_save_to_gallery(person_id, image, feature)
 
