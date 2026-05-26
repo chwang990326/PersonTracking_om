@@ -132,6 +132,44 @@ def _scale_keypoints(kpts, ratio, pad, original_shape):
     return kpts
 
 
+def _visible_keypoint_box(keypoints, conf_thres=0.3):
+    visible = keypoints[:, :, 2] > conf_thres
+    boxes = np.zeros((keypoints.shape[0], 4), dtype=np.float32)
+    valid = visible.any(axis=1)
+    if np.any(valid):
+        xs = np.where(visible, keypoints[:, :, 0], np.nan)
+        ys = np.where(visible, keypoints[:, :, 1], np.nan)
+        boxes[valid, 0] = np.nanmin(xs[valid], axis=1)
+        boxes[valid, 1] = np.nanmin(ys[valid], axis=1)
+        boxes[valid, 2] = np.nanmax(xs[valid], axis=1)
+        boxes[valid, 3] = np.nanmax(ys[valid], axis=1)
+    return boxes, valid
+
+
+def _box_contains_points_score(boxes, point_boxes, valid):
+    if boxes.size == 0 or point_boxes.size == 0:
+        return 0.0
+
+    valid_count = int(np.sum(valid))
+    if valid_count == 0:
+        widths = np.maximum(0.0, boxes[:, 2] - boxes[:, 0])
+        heights = np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
+        return -float(np.mean(widths * heights)) if len(widths) else 0.0
+
+    candidate = boxes[valid]
+    points = point_boxes[valid]
+    contains = (
+        (candidate[:, 0] <= points[:, 0])
+        & (candidate[:, 1] <= points[:, 1])
+        & (candidate[:, 2] >= points[:, 2])
+        & (candidate[:, 3] >= points[:, 3])
+    )
+    widths = np.maximum(0.0, candidate[:, 2] - candidate[:, 0])
+    heights = np.maximum(0.0, candidate[:, 3] - candidate[:, 1])
+    areas = widths * heights
+    return float(np.mean(contains)) - 1e-8 * float(np.mean(areas))
+
+
 def _box_iou(box, boxes):
     if boxes.size == 0:
         return np.empty((0,), dtype=np.float32)
@@ -366,7 +404,6 @@ class AscendYOLO:
         if raw_boxes.size and np.nanmax(raw_boxes) <= 2.0:
             raw_boxes[:, [0, 2]] *= self.input_size[1]
             raw_boxes[:, [1, 3]] *= self.input_size[0]
-        boxes = _scale_boxes(_xywh_to_xyxy(raw_boxes), ratio, pad, original_shape)
         keypoints = pred[:, kpt_start : kpt_start + keypoint_values].reshape(-1, num_keypoints, 3)
         keypoints[:, :, 2] = _sigmoid_if_needed(keypoints[:, :, 2])
         if keypoints.size and np.nanmax(keypoints[:, :, :2]) <= 2.0:
@@ -374,6 +411,12 @@ class AscendYOLO:
             keypoints[:, :, 0] *= self.input_size[1]
             keypoints[:, :, 1] *= self.input_size[0]
         keypoints = _scale_keypoints(keypoints, ratio, pad, original_shape)
+        xywh_boxes = _scale_boxes(_xywh_to_xyxy(raw_boxes), ratio, pad, original_shape)
+        xyxy_boxes = _scale_boxes(raw_boxes, ratio, pad, original_shape)
+        point_boxes, point_valid = _visible_keypoint_box(keypoints)
+        xywh_score = _box_contains_points_score(xywh_boxes, point_boxes, point_valid)
+        xyxy_score = _box_contains_points_score(xyxy_boxes, point_boxes, point_valid)
+        boxes = xyxy_boxes if xyxy_score > xywh_score else xywh_boxes
 
         mask = scores >= conf_thres
         boxes = boxes[mask]
