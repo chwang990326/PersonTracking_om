@@ -216,6 +216,21 @@ class TestUnknownSampleManagement:
         cleaned = redis_memory.cleanup_stale_unknowns()
         assert cleaned >= 1
 
+    def test_cleanup_does_not_remove_active_entity(self, redis_memory, face_embedding):
+        """Active entities (with unknown: prefix) must not be cleaned up."""
+        uid = redis_memory.allocate_unknown_id()
+        assert uid.startswith("unknown:")
+        redis_memory.add_unknown_face_sample(uid, face_embedding)
+        client = redis_memory._client()
+        sample_set_key = f"test_pt:unknown_samples:{uid}"
+        entity_key = f"test_pt:unknown_entity:{uid}"
+        assert client.exists(sample_set_key)
+        assert client.exists(entity_key)
+        cleaned = redis_memory.cleanup_stale_unknowns()
+        assert cleaned == 0, f"cleanup incorrectly removed active entity {uid}"
+        assert client.exists(sample_set_key), "sample_set should still exist"
+        assert client.exists(entity_key), "entity should still exist"
+
 
 class TestKnownSampleManagement:
     """Known identity sample management tests."""
