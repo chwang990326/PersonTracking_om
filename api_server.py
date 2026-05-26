@@ -372,5 +372,5 @@ async def third_face_verify(request: ThirdFaceVerifyRequest):
 
 if __name__ == "__main__":
     # 启动服务
-    uvicorn.run(app, host="0.0.0.0", port=8135)
+    uvicorn.run(app, host="0.0.0.0", port=8130)
 
