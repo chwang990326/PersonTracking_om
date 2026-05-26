@@ -114,10 +114,15 @@ class TestEmbeddingSerialization:
 class TestUnknownIDAllocation:
     """Unknown ID allocation tests."""
 
-    def test_allocate_id_returns_increasing(self, redis_memory):
+    def test_allocate_id_returns_unique_uuid(self, redis_memory):
         id1 = redis_memory.allocate_unknown_id()
         id2 = redis_memory.allocate_unknown_id()
-        assert id2 > id1
+        # unknown:UUID strings: "unknown:" prefix + 32 hex chars
+        assert isinstance(id1, str)
+        assert isinstance(id2, str)
+        assert id1.startswith("unknown:") and len(id1) == 40
+        assert id2.startswith("unknown:") and len(id2) == 40
+        assert id1 != id2
 
     def test_allocate_id_creates_entity(self, redis_memory):
         new_id = redis_memory.allocate_unknown_id()
@@ -283,13 +288,13 @@ class TestFindOrCreateUnknown:
 
     def test_find_or_create_new_when_no_match(self, redis_memory, reid_embedding):
         result = redis_memory.find_or_create_unknown(reid_embedding, 0.99, "reid")
-        assert isinstance(result, int)
-        assert result > 0
+        assert isinstance(result, str)
+        assert result.startswith("unknown:") and len(result) == 40
 
     def test_allocate_id_basic(self, redis_memory):
         uid = redis_memory.allocate_unknown_id()
-        assert isinstance(uid, int)
-        assert uid > 0
+        assert isinstance(uid, str)
+        assert uid.startswith("unknown:") and len(uid) == 40
 
     def test_find_or_create_face(self, redis_memory, face_embedding):
         uid = redis_memory.allocate_unknown_id()
@@ -360,7 +365,6 @@ class TestStats:
     def test_get_stats(self, redis_memory):
         stats = redis_memory.get_stats()
         assert stats["available"] is True
-        assert "unknown_counter" in stats
         assert "unknown_entity_count" in stats
 
     def test_flush_unknowns(self, redis_memory):

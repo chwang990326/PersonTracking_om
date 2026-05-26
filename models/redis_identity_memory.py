@@ -513,16 +513,20 @@ class RedisIdentityMemory:
         unknown_id, similarity = self._search_internal(
             self._idx_unknown_face, embedding, threshold, k, "unknown_id"
         )
-        return int(unknown_id) if unknown_id is not None else None, similarity
+        if unknown_id is not None:
+            unknown_id = unknown_id.decode() if isinstance(unknown_id, bytes) else str(unknown_id)
+        return unknown_id, similarity
 
     def search_unknown_reid(
         self, embedding: np.ndarray, threshold: float, top_k: int = None
-    ) -> Tuple[Optional[int], float]:
+    ) -> Tuple[Optional[str], float]:
         k = top_k or self.vector_search_k
         unknown_id, similarity = self._search_internal(
             self._idx_unknown_reid, embedding, threshold, k, "unknown_id"
         )
-        return int(unknown_id) if unknown_id is not None else None, similarity
+        if unknown_id is not None:
+            unknown_id = unknown_id.decode() if isinstance(unknown_id, bytes) else str(unknown_id)
+        return unknown_id, similarity
 
     # ------------------------------------------------------------------
     # Unknown find-or-create（并发安全）
@@ -530,14 +534,14 @@ class RedisIdentityMemory:
 
     def find_or_create_unknown(
         self, embedding: np.ndarray, threshold: float, modality: str
-    ) -> int:
+    ) -> str:
         """
         中央 find-or-create。并发安全。
         Args:
             embedding: 特征向量
             threshold: cosine similarity 阈值
             modality: 'face' 或 'reid'
-        Returns: unknown_id
+        Returns: unknown_id (UUID hex string)
         """
         self._ensure_available()
         embedding = np.asarray(embedding, dtype=np.float32).ravel()
@@ -566,13 +570,13 @@ class RedisIdentityMemory:
                 if existing_id is not None:
                     return existing_id
 
-                # Step 4: 分配新 ID
-                client = self._client()
-                new_id = client.incr(self._prefix_unknown_counter)
+                # Step 4: 分配新 ID（unknown:UUID）
+                new_id = f"unknown:{uuid.uuid4().hex}"
 
                 # Step 5: 创建实体主状态
                 entity_key = f"{self._prefix_unknown_entity}:{new_id}"
                 now = time.time()
+                client = self._client()
                 client.hset(entity_key, mapping={
                     "unknown_id": str(new_id),
                     "face_count": "0",
@@ -595,11 +599,11 @@ class RedisIdentityMemory:
             f"find_or_create_unknown 重试 {self.claim_lock_max_retries} 次后仍无法获取锁"
         )
 
-    def allocate_unknown_id(self) -> int:
-        """简单 INCR 分配 unknown ID（调用方已确认需要新 ID）。"""
+    def allocate_unknown_id(self) -> str:
+        """分配新的 unknown ID（unknown:UUID）。调用方已确认需要新 ID。"""
         self._ensure_available()
+        new_id = f"unknown:{uuid.uuid4().hex}"
         client = self._client()
-        new_id = client.incr(self._prefix_unknown_counter)
         entity_key = f"{self._prefix_unknown_entity}:{new_id}"
         now = time.time()
         client.hset(entity_key, mapping={
@@ -660,7 +664,7 @@ class RedisIdentityMemory:
         if len(embedding) != dim:
             return False
 
-        unknown_id = int(unknown_id)
+        unknown_id = str(unknown_id)
         client = self._client()
         entity_key = f"{self._prefix_unknown_entity}:{unknown_id}"
         sample_set_key = f"{self._prefix_unknown_samples}:{unknown_id}"
@@ -670,7 +674,7 @@ class RedisIdentityMemory:
             # 实体不存在时自动创建
             now = time.time()
             client.hset(entity_key, mapping={
-                "unknown_id": str(unknown_id),
+                "unknown_id": unknown_id,
                 "face_count": "0",
                 "reid_count": "0",
                 "last_seen": str(now),
@@ -742,12 +746,12 @@ class RedisIdentityMemory:
     # Unknown 生命周期管理
     # ------------------------------------------------------------------
 
-    def touch_unknown(self, unknown_id: int):
+    def touch_unknown(self, unknown_id):
         """更新 unknown entity 及所有样本的 TTL 和 last_seen。"""
         if unknown_id in (-1, None):
             return
         self._ensure_available()
-        unknown_id = int(unknown_id)
+        unknown_id = str(unknown_id)
         client = self._client()
         entity_key = f"{self._prefix_unknown_entity}:{unknown_id}"
         sample_set_key = f"{self._prefix_unknown_samples}:{unknown_id}"
@@ -768,12 +772,12 @@ class RedisIdentityMemory:
             client.hset(entity_key, "last_seen", str(now))
             client.expire(sample_set_key, self.unknown_ttl)
 
-    def release_unknown(self, unknown_id: int):
+    def release_unknown(self, unknown_id):
         """删除 unknown entity 及所有关联数据。"""
         if unknown_id in (-1, None):
             return
         self._ensure_available()
-        unknown_id = int(unknown_id)
+        unknown_id = str(unknown_id)
         client = self._client()
         entity_key = f"{self._prefix_unknown_entity}:{unknown_id}"
         sample_set_key = f"{self._prefix_unknown_samples}:{unknown_id}"
@@ -784,12 +788,12 @@ class RedisIdentityMemory:
         client.delete(sample_set_key)
         client.delete(entity_key)
 
-    def release_if_empty(self, unknown_id: int):
+    def release_if_empty(self, unknown_id):
         """如果 face_count 和 reid_count 均为 0，则释放。"""
         if unknown_id in (-1, None):
             return
         self._ensure_available()
-        unknown_id = int(unknown_id)
+        unknown_id = str(unknown_id)
         client = self._client()
         entity_key = f"{self._prefix_unknown_entity}:{unknown_id}"
 
@@ -1013,8 +1017,6 @@ class RedisIdentityMemory:
                 stats[idx_name] = info_dict.get("num_docs", 0)
             except Exception:
                 stats[idx_name] = -1
-
-        stats["unknown_counter"] = int(client.get(self._prefix_unknown_counter) or 0)
 
         entity_pattern = f"{self._prefix_unknown_entity}:*"
         cursor = 0

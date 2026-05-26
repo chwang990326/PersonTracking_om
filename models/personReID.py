@@ -162,9 +162,21 @@ class PersonReidentifier:
 
     def _is_temporary_identity(self, person_id):
         person_id = self._normalize_identity_value(person_id)
-        return isinstance(person_id, int) or (
-            isinstance(person_id, str) and person_id.isdigit()
-        )
+        if person_id in (None, '', -1):
+            return False
+        if isinstance(person_id, int):
+            return True
+        if isinstance(person_id, str):
+            # 数字字符串（兼容旧数据）
+            if person_id.isdigit():
+                return True
+            # unknown:UUID (如 unknown:a1b2c3d4...)
+            if person_id.startswith("unknown:"):
+                return True
+            # 纯 UUID hex（兼容旧格式）
+            if len(person_id) == 32 and all(c in '0123456789abcdef' for c in person_id):
+                return True
+        return False
 
     def _is_known_identity(self, person_id):
         person_id = self._normalize_identity_value(person_id)
@@ -177,14 +189,14 @@ class PersonReidentifier:
 
     def _allocate_temporary_id(self):
         """
-        分配一个全局唯一的临时ID，优先使用外部生成器，如果没有则使用本地逻辑。
+        分配一个全局唯一的临时ID（UUID），优先使用外部生成器（Redis），
+        否则使用本地 uuid4。
         """
         if self.id_generator:
             return self.id_generator()
 
-        tid = self._local_id_counter
-        self._local_id_counter += 1
-        return tid
+        import uuid
+        return f"unknown:{uuid.uuid4().hex}"
 
     def refresh_track_state(self, active_track_ids):
         """
@@ -477,9 +489,9 @@ class PersonReidentifier:
         if not self._is_auto_save_enabled():
             return False
 
-        is_temp_id = str(person_id).isdigit()
+        is_temp_id = self._is_temporary_identity(person_id)
 
-        # 临时ID (数字)：不保存已知库，只记录即可
+        # 临时ID：不保存已知库，只记录即可
         if is_temp_id:
             if not force:
                 if not self._check_temp_identity_dedup(feature_vector, person_id):
@@ -823,7 +835,7 @@ class PersonReidentifier:
             print(f"[ReID] 人脸校准: Track {track_id} ({old_id}) -> {new_person_id}")
             
             # 1. 身份合并 (如果是临时ID -> 真实ID)
-            is_temp_id = isinstance(old_id, int) or (isinstance(old_id, str) and old_id.isdigit())
+            is_temp_id = self._is_temporary_identity(old_id)
             if is_temp_id:
                 self._merge_identities(old_id, new_person_id)
             
@@ -914,7 +926,7 @@ class PersonReidentifier:
                 top_matches = self.redis_memory.search_unknown_reid(
                     feature_vec, self.TEMP_ID_DEDUP_THRESHOLD, top_k=5
                 )
-                if top_matches[0] is not None and top_matches[0] == int(person_id) and top_matches[1] > self.TEMP_ID_DEDUP_THRESHOLD:
+                if top_matches[0] is not None and str(top_matches[0]) == str(person_id) and top_matches[1] > self.TEMP_ID_DEDUP_THRESHOLD:
                     return False
             except Exception:
                 pass
@@ -922,7 +934,7 @@ class PersonReidentifier:
         # 写入 Redis 中央记忆库（内部已包含 touch/续期）
         if self.redis_memory is not None and self.redis_memory.available:
             try:
-                self.redis_memory.add_unknown_reid_sample(int(person_id), feature_vec)
+                self.redis_memory.add_unknown_reid_sample(str(person_id), feature_vec)
             except Exception as e:
                 print(f"[ReID] Redis 写入 unknown_reid 失败: {e}")
                 return False
@@ -1174,7 +1186,7 @@ class PersonReidentifier:
             return
 
         # 临时ID只存1张
-        is_temp_id = str(person_id).isdigit()
+        is_temp_id = self._is_temporary_identity(person_id)
         if is_temp_id:
             if self._get_gallery_features(person_id) is not None:
                 return

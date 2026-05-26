@@ -30,8 +30,8 @@ class UnknownEntityStore:
     # ID 分配
     # ------------------------------------------------------------------
 
-    def allocate_id(self) -> int:
-        """分配全局唯一 unknown ID（委托 Redis INCR）。"""
+    def allocate_id(self) -> str:
+        """分配全局唯一 unknown ID（委托 Redis UUID）。"""
         if self._redis is None or not self._redis.available:
             return -1
         try:
@@ -49,7 +49,7 @@ class UnknownEntityStore:
         if unknown_id in (-1, None) or self._redis is None or not self._redis.available:
             return
         try:
-            self._redis.touch_unknown(int(unknown_id))
+            self._redis.touch_unknown(str(unknown_id))
         except Exception as e:
             print(f"[UnknownEntityStore] touch_entity 失败: {e}")
 
@@ -58,7 +58,7 @@ class UnknownEntityStore:
         if unknown_id in (-1, None) or self._redis is None or not self._redis.available:
             return
         try:
-            self._redis.release_if_empty(int(unknown_id))
+            self._redis.release_if_empty(str(unknown_id))
         except Exception as e:
             print(f"[UnknownEntityStore] release_if_empty 失败: {e}")
 
@@ -67,7 +67,7 @@ class UnknownEntityStore:
         if unknown_id in (-1, None) or self._redis is None or not self._redis.available:
             return
         try:
-            self._redis.release_unknown(int(unknown_id))
+            self._redis.release_unknown(str(unknown_id))
         except Exception as e:
             print(f"[UnknownEntityStore] release_entity 失败: {e}")
 
@@ -84,7 +84,7 @@ class UnknownEntityStore:
     # 人脸检索 & 样本
     # ------------------------------------------------------------------
 
-    def search_face_embedding(self, embedding: np.ndarray) -> Tuple[Optional[int], float]:
+    def search_face_embedding(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
         """在未知人脸库中搜索。返回 (unknown_id, similarity)。"""
         if self._redis is None or not self._redis.available:
             return None, 0.0
@@ -104,7 +104,7 @@ class UnknownEntityStore:
         if embedding is None:
             return False
         try:
-            return self._redis.add_unknown_face_sample(int(unknown_id), embedding)
+            return self._redis.add_unknown_face_sample(str(unknown_id), embedding)
         except Exception as e:
             print(f"[UnknownEntityStore] add_face_sample 失败: {e}")
             return False

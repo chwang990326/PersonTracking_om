@@ -191,8 +191,22 @@ class VisionAnalysisService:
     def _is_temporary_identity(person_id):
         """
         判断一个 person_id 是否属于临时未知 ID 的范围。
+        支持旧数字格式（兼容）和新 UUID hex 格式。
         """
-        return isinstance(person_id, int) or (isinstance(person_id, str) and person_id.isdigit())
+        if person_id in (None, '', -1):
+            return False
+        if isinstance(person_id, int):
+            return True
+        if isinstance(person_id, str):
+            if person_id.isdigit():
+                return True
+            # unknown:UUID (如 unknown:a1b2c3d4...)
+            if person_id.startswith("unknown:"):
+                return True
+            # 纯 UUID hex（兼容旧格式）
+            if len(person_id) == 32 and all(c in '0123456789abcdef' for c in person_id):
+                return True
+        return False
 
     def _is_strict_unknown_face_ready(self, kp_data):
         """
