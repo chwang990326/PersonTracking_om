@@ -1,5 +1,5 @@
 """
-Send /video/test1.mp4 to the person-detect API at one frame every five seconds
+Send /video/test1.mp4 to the person-detect API at five frames per second
 and render returned person boxes onto an output video.
 
 The HTTP API does not return the 17 pose keypoint coordinates or posture labels.
@@ -28,10 +28,10 @@ DEFAULT_VIDEO_PATH = "/video/test3.mp4"
 DEFAULT_FALLBACK_VIDEO_PATH = "video/test3.mp4"
 DEFAULT_API_URL = "http://192.168.100.64:8130/api/v1/person/detect"
 DEFAULT_CAMERA_ID = "203"
-DEFAULT_INTERVAL_SECONDS = 5.0
+DEFAULT_TARGET_FPS = 5.0
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_OUTPUT_DIR = "results"
-DEFAULT_OUTPUT_FPS = 1.0
+DEFAULT_OUTPUT_FPS = 5.0
 DEFAULT_JPEG_QUALITY = 90
 DEFAULT_LOCAL_POSE_CONF = 0.5
 DEFAULT_LOCAL_POSE_MATCH_IOU = 0.1
@@ -58,21 +58,27 @@ COCO_SKELETON = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render person boxes from /api/v1/person/detect for one frame every five seconds."
+        description="Render person boxes from /api/v1/person/detect at five frames per second."
     )
     parser.add_argument("--video-path", default=DEFAULT_VIDEO_PATH, help="Input video path")
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Person detect API URL")
     parser.add_argument("--camera-id", default=DEFAULT_CAMERA_ID, help="camera_id sent to API")
     parser.add_argument(
-        "--interval-sec",
+        "--target-fps",
         type=float,
-        default=DEFAULT_INTERVAL_SECONDS,
-        help="Sample and send one frame every N source seconds",
+        default=DEFAULT_TARGET_FPS,
+        help="Sample and send FPS. Default is 5 FPS",
     )
     parser.add_argument(
-        "--pace-real-time",
+        "--interval-sec",
+        type=float,
+        default=0.0,
+        help="Override --target-fps and send one frame every N source seconds",
+    )
+    parser.add_argument(
+        "--no-pace-real-time",
         action="store_true",
-        help="Also wait N wall-clock seconds between requests",
+        help="Do not wait between request starts; process as fast as possible",
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="HTTP timeout seconds")
     parser.add_argument("--max-requests", type=int, default=0, help="Stop after N requests; 0 means full video")
@@ -449,9 +455,17 @@ def main() -> None:
     source_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_step = max(1, int(round(source_fps * args.interval_sec)))
+    if args.interval_sec > 0:
+        interval_sec = float(args.interval_sec)
+        effective_target_fps = 1.0 / interval_sec
+    else:
+        if args.target_fps <= 0:
+            raise ValueError("--target-fps must be greater than 0")
+        effective_target_fps = float(args.target_fps)
+        interval_sec = 1.0 / effective_target_fps
+    frame_step = max(1, int(round(source_fps * interval_sec)))
 
-    run_name = f"test1_5sec_render_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"test1_5fps_render_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.output_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     output_video_path = run_dir / "annotated.mp4"
@@ -475,7 +489,8 @@ def main() -> None:
     print(f"api_url={args.api_url}")
     print(f"camera_id={args.camera_id}")
     print(f"source_fps={source_fps:.3f}")
-    print(f"interval_sec={args.interval_sec}")
+    print(f"target_fps={effective_target_fps:.3f}")
+    print(f"interval_sec={interval_sec:.3f}")
     print(f"frame_step={frame_step}")
     print(f"output_video={output_video_path}")
     print(f"output_json={output_json_path}")
@@ -492,8 +507,8 @@ def main() -> None:
             if not ok:
                 break
 
-            if args.pace_real_time and last_send_started_at is not None:
-                wait_sec = args.interval_sec - (time.time() - last_send_started_at)
+            if not args.no_pace_real_time and last_send_started_at is not None:
+                wait_sec = interval_sec - (time.time() - last_send_started_at)
                 if wait_sec > 0:
                     time.sleep(wait_sec)
 
@@ -560,7 +575,8 @@ def main() -> None:
                 "video_path": str(video_path),
                 "api_url": args.api_url,
                 "camera_id": args.camera_id,
-                "interval_sec": args.interval_sec,
+                "target_fps": effective_target_fps,
+                "interval_sec": interval_sec,
                 "frame_step": frame_step,
                 "output_video": str(output_video_path),
                 "records": records,
