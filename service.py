@@ -808,6 +808,7 @@ class VisionAnalysisService:
                                         frame_shape=frame.shape,
                                         all_boxes=boxes,
                                         current_idx=current_idx,
+                                        keypoints=kp_data,
                                     )
                 profiler.stop("10_Face_Recognition")
 

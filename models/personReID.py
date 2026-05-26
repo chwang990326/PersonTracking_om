@@ -886,7 +886,7 @@ class PersonReidentifier:
         blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
         return blur_score >= 30
 
-    def save_unknown_reid_sample(self, track_id, person_id, image, box=None, frame_shape=None, all_boxes=None, current_idx=None):
+    def save_unknown_reid_sample(self, track_id, person_id, image, box=None, frame_shape=None, all_boxes=None, current_idx=None, keypoints=None):
         """
         保存未知身份的 ReID 特征到 Redis 中央记忆库。
         image 参数保留用于接口兼容和质量检查，实际不再写盘。
@@ -912,7 +912,7 @@ class PersonReidentifier:
         if all_boxes is not None and current_idx is not None and self._check_overlap(current_idx, all_boxes):
             return False
 
-        if not self._check_upper_body_quality(image, require_face=False):
+        if not self._check_upper_body_quality(image, require_face=False, keypoints=keypoints):
             return False
 
         if not self._check_basic_image_quality(image):
@@ -941,12 +941,72 @@ class PersonReidentifier:
 
         return True
 
-    def _check_upper_body_quality(self, image, require_face=True):
+    def _check_keypoints_upper_body_quality(self, keypoints, require_face=True):
+        keypoints = np.asarray(keypoints)
+        if keypoints.ndim != 2 or keypoints.shape[1] < 3:
+            print("[ReID] Invalid keypoints for upper-body quality check.")
+            return False
+
+        has_nose = (0 < len(keypoints) and keypoints[0, 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD)
+        has_left_eye = (1 < len(keypoints) and keypoints[1, 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD)
+        has_right_eye = (2 < len(keypoints) and keypoints[2, 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD)
+
+        visible_head_parts = 0
+        for kp_idx in [0, 1, 2, 3, 4]:
+            if kp_idx < len(keypoints) and keypoints[kp_idx, 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD:
+                visible_head_parts += 1
+
+        left_shoulder_visible = (
+            self.UPPER_BODY_KEYPOINTS['left_shoulder'] < len(keypoints) and
+            keypoints[self.UPPER_BODY_KEYPOINTS['left_shoulder'], 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD
+        )
+        right_shoulder_visible = (
+            self.UPPER_BODY_KEYPOINTS['right_shoulder'] < len(keypoints) and
+            keypoints[self.UPPER_BODY_KEYPOINTS['right_shoulder'], 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD
+        )
+        left_hip_visible = (
+            self.UPPER_BODY_KEYPOINTS['left_hip'] < len(keypoints) and
+            keypoints[self.UPPER_BODY_KEYPOINTS['left_hip'], 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD
+        )
+        right_hip_visible = (
+            self.UPPER_BODY_KEYPOINTS['right_hip'] < len(keypoints) and
+            keypoints[self.UPPER_BODY_KEYPOINTS['right_hip'], 2] > self.KEYPOINT_CONFIDENCE_THRESHOLD
+        )
+
+        if require_face:
+            is_frontal_face = has_nose and has_left_eye and has_right_eye
+            return (
+                is_frontal_face and
+                left_shoulder_visible and
+                right_shoulder_visible and
+                left_hip_visible and
+                right_hip_visible
+            )
+
+        is_frontal_view = (
+            visible_head_parts >= 1 and
+            left_shoulder_visible and
+            right_shoulder_visible and
+            left_hip_visible and
+            right_hip_visible
+        )
+        is_back_view = (
+            left_shoulder_visible and
+            right_shoulder_visible and
+            left_hip_visible and
+            right_hip_visible
+        )
+        return is_frontal_view or is_back_view
+
+    def _check_upper_body_quality(self, image, require_face=True, keypoints=None):
         """
         检查图像是否包含完整的上半身关键点。
         参数:
             require_face (bool): 是否强制要求检测到正面人脸
         """
+        if keypoints is not None:
+            return self._check_keypoints_upper_body_quality(keypoints, require_face=require_face)
+
         if self.pose_estimator is None:
             print("[ReID] 警告: 未配置姿态估计器，跳过关键点质量检查。")
             return True
