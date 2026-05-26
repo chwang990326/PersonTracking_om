@@ -29,7 +29,7 @@ import requests
 
 
 # DEFAULT_VIDEO_PATHS = "video/test1.mp4,video/test2.mp4,video/test3.mp4,video/test4.mp4"
-DEFAULT_VIDEO_PATHS = "video/test1.mp4,video/test2.mp4,video/test3.mp4,video/test4.mp4"
+DEFAULT_VIDEO_PATHS = "video/test1.mp4"
 DEFAULT_API_URL = "http://127.0.0.1:8135/api/v1/person/detect"
 DEFAULT_CAMERA_IDS = "204"
 DEFAULT_TARGET_FPS = 5.0
