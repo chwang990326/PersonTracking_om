@@ -407,17 +407,27 @@ class AscendYOLO:
         num_keypoints = 17
         keypoint_values = num_keypoints * 3
         attrs = pred.shape[1]
-        if attrs == 4 + 1 + keypoint_values:
+        is_nms_pose_output = (
+            attrs == 4 + 2 + keypoint_values
+            and pred.shape[0] <= 1000
+        )
+        if is_nms_pose_output:
+            scores = _sigmoid_if_needed(pred[:, 4])
+            cls_ids = pred[:, 5].astype(np.int64)
+            kpt_start = 6
+            box_format = "xyxy"
+        elif attrs == 4 + 1 + keypoint_values:
             scores = _sigmoid_if_needed(pred[:, 4])
             cls_ids = np.zeros((pred.shape[0],), dtype=np.int64)
             kpt_start = 5
+            box_format = "xywh"
         elif attrs >= 4 + 2 + keypoint_values:
-            num_classes = attrs - 4 - keypoint_values - 1
-            obj = _sigmoid_if_needed(pred[:, 4])
-            class_scores = _sigmoid_if_needed(pred[:, 5 : 5 + num_classes])
+            num_classes = attrs - 4 - keypoint_values
+            class_scores = _sigmoid_if_needed(pred[:, 4 : 4 + num_classes])
             cls_ids = class_scores.argmax(axis=1)
-            scores = obj * class_scores[np.arange(len(class_scores)), cls_ids]
-            kpt_start = 5 + num_classes
+            scores = class_scores[np.arange(len(class_scores)), cls_ids]
+            kpt_start = 4 + num_classes
+            box_format = "xywh"
         else:
             return AscendResult(
                 AscendBoxes(np.empty((0, 4), dtype=np.float32)),
@@ -435,12 +445,17 @@ class AscendYOLO:
             keypoints[:, :, 0] *= self.input_size[1]
             keypoints[:, :, 1] *= self.input_size[0]
         keypoints = _scale_keypoints(keypoints, ratio, pad, original_shape)
-        xywh_boxes = _scale_boxes(_xywh_to_xyxy(raw_boxes), ratio, pad, original_shape)
-        xyxy_boxes = _scale_boxes(raw_boxes, ratio, pad, original_shape)
-        point_boxes, point_valid = _visible_keypoint_box(keypoints)
-        xywh_score = _box_contains_points_score(xywh_boxes, point_boxes, point_valid)
-        xyxy_score = _box_contains_points_score(xyxy_boxes, point_boxes, point_valid)
-        boxes = xyxy_boxes if xyxy_score > xywh_score else xywh_boxes
+        if box_format == "xyxy":
+            xywh_boxes = None
+            xyxy_boxes = _scale_boxes(raw_boxes, ratio, pad, original_shape)
+            boxes = xyxy_boxes
+        else:
+            xywh_boxes = _scale_boxes(_xywh_to_xyxy(raw_boxes), ratio, pad, original_shape)
+            xyxy_boxes = _scale_boxes(raw_boxes, ratio, pad, original_shape)
+            point_boxes, point_valid = _visible_keypoint_box(keypoints)
+            xywh_score = _box_contains_points_score(xywh_boxes, point_boxes, point_valid)
+            xyxy_score = _box_contains_points_score(xyxy_boxes, point_boxes, point_valid)
+            boxes = xyxy_boxes if xyxy_score > xywh_score else xywh_boxes
         if not self._debug_pose_decode_printed:
             top_idx = int(np.argmax(scores)) if scores.size else -1
             if top_idx >= 0:
@@ -457,9 +472,9 @@ class AscendYOLO:
                     f"attrs={attrs} score_max={float(scores[top_idx]):.4f} "
                     f"score_count_ge_conf={int(np.sum(scores >= conf_thres))} "
                     f"top_raw_box={raw_boxes[top_idx].tolist()} "
-                    f"top_xywh_box={xywh_boxes[top_idx].tolist()} "
+                    f"top_xywh_box={xywh_boxes[top_idx].tolist() if xywh_boxes is not None else None} "
                     f"top_xyxy_box={xyxy_boxes[top_idx].tolist()} "
-                    f"selected={'xyxy' if xyxy_score > xywh_score else 'xywh'} "
+                    f"selected={box_format} "
                     f"kpt_range={kpt_range}"
                 )
             self._debug_pose_decode_printed = True
