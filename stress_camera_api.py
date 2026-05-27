@@ -14,15 +14,13 @@ import csv
 import json
 import math
 import os
-import re
 import statistics
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence
 
 
 DEFAULT_API_URL = "http://192.168.14.42:8130/api/v1/person/detect"
@@ -60,14 +58,6 @@ class StageMetrics:
     request_errors: int = 0
     latencies_ms: List[float] = field(default_factory=list)
     per_camera: Dict[str, CameraMetrics] = field(default_factory=dict)
-    avg_latency_ms: float = 0.0
-    avg_cpu_percent: float = 0.0
-    avg_npu_aicore_percent: float = 0.0
-    avg_npu_memory_percent: float = 0.0
-    avg_npu_memory_used_mb: float = 0.0
-    resource_sample_count: int = 0
-    npu_device_aicore_percent: Dict[str, float] = field(default_factory=dict)
-    npu_device_memory_percent: Dict[str, float] = field(default_factory=dict)
 
     @property
     def success_fps_total(self) -> float:
@@ -165,118 +155,6 @@ class MetricsRecorder:
                 self.metrics.request_errors += 1
 
 
-@dataclass
-class NpuSample:
-    device_id: str
-    aicore_percent: float
-    memory_used_mb: float
-    memory_total_mb: float
-
-
-@dataclass
-class ResourceMetrics:
-    avg_cpu_percent: float = 0.0
-    avg_npu_aicore_percent: float = 0.0
-    avg_npu_memory_percent: float = 0.0
-    avg_npu_memory_used_mb: float = 0.0
-    sample_count: int = 0
-    npu_device_aicore_percent: Dict[str, float] = field(default_factory=dict)
-    npu_device_memory_percent: Dict[str, float] = field(default_factory=dict)
-
-
-class ResourceMonitor:
-    def __init__(self, sample_interval_seconds: float) -> None:
-        self.sample_interval_seconds = max(0.5, sample_interval_seconds)
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-        self._cpu_samples: List[float] = []
-        self._npu_samples: List[List[NpuSample]] = []
-
-    def start(self) -> None:
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, name="resource-monitor", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> ResourceMetrics:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.sample_interval_seconds + 2.0)
-        return self._build_metrics()
-
-    def _run(self) -> None:
-        previous_cpu = read_cpu_times()
-        while not self._stop_event.wait(self.sample_interval_seconds):
-            current_cpu = read_cpu_times()
-            cpu_percent = calculate_cpu_percent(previous_cpu, current_cpu)
-            previous_cpu = current_cpu
-            npu_samples = read_npu_info()
-            with self._lock:
-                self._cpu_samples.append(cpu_percent)
-                if npu_samples:
-                    self._npu_samples.append(npu_samples)
-
-    def _build_metrics(self) -> ResourceMetrics:
-        with self._lock:
-            cpu_samples = list(self._cpu_samples)
-            npu_snapshots = list(self._npu_samples)
-
-        device_aicore: Dict[str, List[float]] = {}
-        device_memory_percent: Dict[str, List[float]] = {}
-        flattened_npu: List[NpuSample] = []
-        for snapshot in npu_snapshots:
-            flattened_npu.extend(snapshot)
-            for sample in snapshot:
-                device_aicore.setdefault(sample.device_id, []).append(sample.aicore_percent)
-                memory_pct = (
-                    (sample.memory_used_mb / sample.memory_total_mb) * 100.0
-                    if sample.memory_total_mb > 0
-                    else 0.0
-                )
-                device_memory_percent.setdefault(sample.device_id, []).append(memory_pct)
-
-        avg_device_aicore = {
-            device_id: statistics.fmean(values)
-            for device_id, values in device_aicore.items()
-            if values
-        }
-        avg_device_memory_percent = {
-            device_id: statistics.fmean(values)
-            for device_id, values in device_memory_percent.items()
-            if values
-        }
-
-        overall_npu_aicore = (
-            statistics.fmean(sample.aicore_percent for sample in flattened_npu)
-            if flattened_npu
-            else 0.0
-        )
-        overall_npu_memory_percent = (
-            statistics.fmean(
-                (sample.memory_used_mb / sample.memory_total_mb) * 100.0
-                for sample in flattened_npu
-                if sample.memory_total_mb > 0
-            )
-            if flattened_npu
-            else 0.0
-        )
-        overall_npu_memory_used = (
-            statistics.fmean(sample.memory_used_mb for sample in flattened_npu)
-            if flattened_npu
-            else 0.0
-        )
-
-        return ResourceMetrics(
-            avg_cpu_percent=statistics.fmean(cpu_samples) if cpu_samples else 0.0,
-            avg_npu_aicore_percent=overall_npu_aicore,
-            avg_npu_memory_percent=overall_npu_memory_percent,
-            avg_npu_memory_used_mb=overall_npu_memory_used,
-            sample_count=max(len(cpu_samples), len(npu_snapshots)),
-            npu_device_aicore_percent=avg_device_aicore,
-            npu_device_memory_percent=avg_device_memory_percent,
-        )
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -301,11 +179,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-cameras", type=int, default=1, help="First camera count to test")
     parser.add_argument("--max-cameras", type=int, default=64, help="Maximum camera count to test")
     parser.add_argument("--step-cameras", type=int, default=1, help="Camera count increment per stage")
-    parser.add_argument(
-        "--run-all-stages",
-        action="store_true",
-        help="Run through max cameras even when the stage falls below threshold",
-    )
     parser.add_argument("--target-fps", type=float, default=5.0, help="Send target FPS for each camera")
     parser.add_argument("--min-fps", type=float, default=5.0, help="Stop when average successful FPS per camera is below this")
     parser.add_argument(
@@ -317,12 +190,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-seconds", type=float, default=10.0, help="Warmup time before each measured stage")
     parser.add_argument("--duration-seconds", type=float, default=60.0, help="Measured time per stage")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP request timeout in seconds")
-    parser.add_argument(
-        "--resource-sample-interval",
-        type=float,
-        default=2.0,
-        help="Sampling interval in seconds for CPU/NPU monitoring during each measured stage",
-    )
     parser.add_argument("--frame-step", type=int, default=0, help="Read one frame every N frames. 0 derives it from video FPS")
     parser.add_argument("--max-preload-frames", type=int, default=600, help="Maximum sampled frames to preload per video")
     parser.add_argument("--encode-format", default=".jpg", choices=[".jpg", ".png"], help="Frame encoding format")
@@ -438,63 +305,6 @@ def percentile(values: Sequence[float], pct: float) -> float:
         return float(ordered[int(rank)])
     weight = rank - lower
     return float(ordered[lower] * (1 - weight) + ordered[upper] * weight)
-
-
-def read_cpu_times() -> Tuple[int, int]:
-    with open("/proc/stat", "r", encoding="utf-8") as handle:
-        first_line = handle.readline()
-    parts = first_line.split()
-    if len(parts) < 5 or parts[0] != "cpu":
-        raise RuntimeError("Unexpected /proc/stat format")
-    values = [int(item) for item in parts[1:]]
-    idle = values[3] + (values[4] if len(values) > 4 else 0)
-    total = sum(values)
-    return total, idle
-
-
-def calculate_cpu_percent(previous: Tuple[int, int], current: Tuple[int, int]) -> float:
-    prev_total, prev_idle = previous
-    curr_total, curr_idle = current
-    total_delta = curr_total - prev_total
-    idle_delta = curr_idle - prev_idle
-    if total_delta <= 0:
-        return 0.0
-    busy_delta = total_delta - idle_delta
-    return max(0.0, min(100.0, busy_delta * 100.0 / total_delta))
-
-
-def read_npu_info() -> List[NpuSample]:
-    try:
-        result = subprocess.run(
-            ["npu-smi", "info"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-
-    if result.returncode != 0:
-        return []
-
-    pattern = re.compile(
-        r"^\|\s*(?P<chip>\d+)\s+(?P<device>\d+)\s+\|.*\|\s*(?P<aicore>\d+)\s+(?P<used>\d+)\s*/\s*(?P<total>\d+)"
-    )
-    samples: List[NpuSample] = []
-    for line in result.stdout.splitlines():
-        match = pattern.match(line)
-        if not match:
-            continue
-        samples.append(
-            NpuSample(
-                device_id=match.group("device"),
-                aicore_percent=float(match.group("aicore")),
-                memory_used_mb=float(match.group("used")),
-                memory_total_mb=float(match.group("total")),
-            )
-        )
-    return samples
 
 
 def make_payload(args: argparse.Namespace, camera_id: str, frame_base64: str) -> Dict[str, object]:
@@ -614,22 +424,11 @@ def run_stage(
     if args.warmup_seconds > 0:
         time.sleep(args.warmup_seconds)
 
-    resource_monitor = ResourceMonitor(sample_interval_seconds=args.resource_sample_interval)
     recorder.start()
-    resource_monitor.start()
     measured_start = time.perf_counter()
     time.sleep(args.duration_seconds)
     measured_duration = time.perf_counter() - measured_start
     metrics = recorder.finish(measured_duration)
-    resource_metrics = resource_monitor.stop()
-    metrics.avg_latency_ms = statistics.fmean(metrics.latencies_ms) if metrics.latencies_ms else 0.0
-    metrics.avg_cpu_percent = resource_metrics.avg_cpu_percent
-    metrics.avg_npu_aicore_percent = resource_metrics.avg_npu_aicore_percent
-    metrics.avg_npu_memory_percent = resource_metrics.avg_npu_memory_percent
-    metrics.avg_npu_memory_used_mb = resource_metrics.avg_npu_memory_used_mb
-    metrics.resource_sample_count = resource_metrics.sample_count
-    metrics.npu_device_aicore_percent = resource_metrics.npu_device_aicore_percent
-    metrics.npu_device_memory_percent = resource_metrics.npu_device_memory_percent
 
     stop_event.set()
     for thread in threads:
@@ -650,14 +449,8 @@ def write_csv(path: Path, rows: Iterable[StageMetrics]) -> None:
         "success_fps_total",
         "success_fps_per_camera",
         "min_camera_fps",
-        "avg_latency_ms",
         "p50_latency_ms",
         "p95_latency_ms",
-        "avg_cpu_percent",
-        "avg_npu_aicore_percent",
-        "avg_npu_memory_percent",
-        "avg_npu_memory_used_mb",
-        "resource_sample_count",
         "http_errors",
         "api_errors",
         "request_errors",
@@ -678,14 +471,8 @@ def write_csv(path: Path, rows: Iterable[StageMetrics]) -> None:
                     "success_fps_total": f"{item.success_fps_total:.3f}",
                     "success_fps_per_camera": f"{item.success_fps_per_camera:.3f}",
                     "min_camera_fps": f"{item.min_camera_fps:.3f}",
-                    "avg_latency_ms": f"{item.avg_latency_ms:.1f}",
                     "p50_latency_ms": f"{item.p50_latency_ms:.1f}",
                     "p95_latency_ms": f"{item.p95_latency_ms:.1f}",
-                    "avg_cpu_percent": f"{item.avg_cpu_percent:.1f}",
-                    "avg_npu_aicore_percent": f"{item.avg_npu_aicore_percent:.1f}",
-                    "avg_npu_memory_percent": f"{item.avg_npu_memory_percent:.1f}",
-                    "avg_npu_memory_used_mb": f"{item.avg_npu_memory_used_mb:.1f}",
-                    "resource_sample_count": item.resource_sample_count,
                     "http_errors": item.http_errors,
                     "api_errors": item.api_errors,
                     "request_errors": item.request_errors,
@@ -705,25 +492,16 @@ def metrics_to_jsonable(metrics: StageMetrics) -> Dict[str, object]:
         "success_fps_total": metrics.success_fps_total,
         "success_fps_per_camera": metrics.success_fps_per_camera,
         "min_camera_fps": metrics.min_camera_fps,
-        "avg_latency_ms": metrics.avg_latency_ms,
         "p50_latency_ms": metrics.p50_latency_ms,
         "p95_latency_ms": metrics.p95_latency_ms,
-        "avg_cpu_percent": metrics.avg_cpu_percent,
-        "avg_npu_aicore_percent": metrics.avg_npu_aicore_percent,
-        "avg_npu_memory_percent": metrics.avg_npu_memory_percent,
-        "avg_npu_memory_used_mb": metrics.avg_npu_memory_used_mb,
-        "resource_sample_count": metrics.resource_sample_count,
         "http_errors": metrics.http_errors,
         "api_errors": metrics.api_errors,
         "request_errors": metrics.request_errors,
-        "npu_device_aicore_percent": metrics.npu_device_aicore_percent,
-        "npu_device_memory_percent": metrics.npu_device_memory_percent,
         "per_camera": {
             name: {
                 "sent": item.sent,
                 "success": item.success,
                 "failed": item.failed,
-                "avg_latency_ms": statistics.fmean(item.latencies_ms) if item.latencies_ms else 0.0,
                 "success_fps": item.success / metrics.duration_seconds if metrics.duration_seconds > 0 else 0.0,
                 "p50_latency_ms": percentile(item.latencies_ms, 50),
                 "p95_latency_ms": percentile(item.latencies_ms, 95),
@@ -740,53 +518,10 @@ def print_stage(metrics: StageMetrics, status: str) -> None:
         f"avg_fps_per_camera={metrics.success_fps_per_camera:.2f} "
         f"min_camera_fps={metrics.min_camera_fps:.2f} "
         f"success_rate={metrics.success_rate:.3f} "
-        f"latency_avg_ms={metrics.avg_latency_ms:.1f} "
         f"latency_p50_ms={metrics.p50_latency_ms:.1f} "
         f"latency_p95_ms={metrics.p95_latency_ms:.1f} "
-        f"cpu_avg={metrics.avg_cpu_percent:.1f}% "
-        f"npu_avg={metrics.avg_npu_aicore_percent:.1f}% "
         f"errors=http:{metrics.http_errors},api:{metrics.api_errors},request:{metrics.request_errors}"
     )
-
-
-def print_summary_table(results: Sequence[StageMetrics]) -> None:
-    headers = [
-        "cams",
-        "avg_ms",
-        "p95_ms",
-        "succ_rate",
-        "succ_fps/cam",
-        "cpu_avg%",
-        "npu_avg%",
-        "npu_mem%",
-    ]
-    rows = [
-        [
-            str(item.camera_count),
-            f"{item.avg_latency_ms:.1f}",
-            f"{item.p95_latency_ms:.1f}",
-            f"{item.success_rate:.3f}",
-            f"{item.success_fps_per_camera:.2f}",
-            f"{item.avg_cpu_percent:.1f}",
-            f"{item.avg_npu_aicore_percent:.1f}",
-            f"{item.avg_npu_memory_percent:.1f}",
-        ]
-        for item in results
-    ]
-    widths = [len(header) for header in headers]
-    for row in rows:
-        for index, value in enumerate(row):
-            widths[index] = max(widths[index], len(value))
-
-    def format_row(row: Sequence[str]) -> str:
-        return " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
-
-    separator = "-+-".join("-" * width for width in widths)
-    print("\nsummary_table")
-    print(format_row(headers))
-    print(separator)
-    for row in rows:
-        print(format_row(row))
 
 
 def import_cv2():
@@ -830,8 +565,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--warmup-seconds cannot be negative")
     if args.timeout <= 0:
         raise ValueError("--timeout must be positive")
-    if args.resource_sample_interval <= 0:
-        raise ValueError("--resource-sample-interval must be positive")
     if not 0 <= args.min_success_rate <= 1:
         raise ValueError("--min-success-rate must be between 0 and 1")
     if not 1 <= args.jpeg_quality <= 100:
@@ -905,8 +638,7 @@ def main() -> None:
             last_passing = metrics
         else:
             first_failing = metrics
-            if not args.run_all_stages:
-                break
+            break
 
     summary = {
         "api_url": args.api_url,
@@ -924,7 +656,6 @@ def main() -> None:
             json.dump(summary, handle, ensure_ascii=False, indent=2)
         print(f"json_saved={json_path}")
 
-    print_summary_table(results)
     print(f"\ncsv_saved={csv_path}")
     print(
         "result: last_passing_camera_count="
