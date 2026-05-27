@@ -1,0 +1,12 @@
+{
+  "pipelines": [
+    {
+      "id": "npu0_worker0",
+      "url": "http://127.0.0.1:8131"
+    },
+    {
+      "id": "npu1_worker0",
+      "url": "http://127.0.0.1:8132"
+    }
+  ]
+}
