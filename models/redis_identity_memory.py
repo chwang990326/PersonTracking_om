@@ -747,21 +747,13 @@ class RedisIdentityMemory:
     # ------------------------------------------------------------------
 
     def touch_unknown(self, unknown_id):
-        """更新 unknown entity 及所有样本的 TTL 和 last_seen。
-
-        仅当 TTL 剩余不足 100 秒时才执行续期，避免高频无效操作。
-        """
+        """更新 unknown entity 及所有样本的 TTL 和 last_seen。"""
         if unknown_id in (-1, None):
             return
         self._ensure_available()
         unknown_id = str(unknown_id)
         client = self._client()
         entity_key = f"{self._prefix_unknown_entity}:{unknown_id}"
-
-        current_ttl = client.ttl(entity_key)
-        if current_ttl >= 100:
-            return
-
         sample_set_key = f"{self._prefix_unknown_samples}:{unknown_id}"
         now = time.time()
 
@@ -775,6 +767,7 @@ class RedisIdentityMemory:
                 str(now),
             )
         except Exception:
+            # fallback: 逐个 EXPIRE
             client.expire(entity_key, self.unknown_ttl)
             client.hset(entity_key, "last_seen", str(now))
             client.expire(sample_set_key, self.unknown_ttl)
@@ -823,17 +816,15 @@ class RedisIdentityMemory:
         cleaned = 0
 
         sample_set_pattern = f"{self._prefix_unknown_samples}:*"
-        sample_set_prefix = f"{self._prefix_unknown_samples}:"
         cursor = 0
         while True:
             cursor, keys = client.scan(cursor, match=sample_set_pattern, count=100)
             for key in keys:
                 if isinstance(key, bytes):
                     key = key.decode()
-                if not key.startswith(sample_set_prefix):
-                    continue
-                unknown_id = key[len(sample_set_prefix):]
-                if not unknown_id:
+                try:
+                    unknown_id = key.rsplit(":", 1)[-1]
+                except (ValueError, IndexError):
                     continue
                 entity_key = f"{self._prefix_unknown_entity}:{unknown_id}"
                 if not client.exists(entity_key):
