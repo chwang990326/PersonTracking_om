@@ -82,12 +82,8 @@ PROFILE_LOG_EVERY="${PROFILE_LOG_EVERY:-100}"
 # 启动 Gateway 使用的 Python 命令。如果在 conda 环境里运行脚本，默认 python 即可。
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# 当前用户能直接使用 docker 就用 docker，否则自动走 sudo docker。
-if docker ps >/dev/null 2>&1; then
-  DOCKER=(docker)
-else
-  DOCKER=(sudo docker)
-fi
+# 统一使用 sudo docker。
+DOCKER=(sudo docker)
 
 log() {
   printf '[start] %s\n' "$*"

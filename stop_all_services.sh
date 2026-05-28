@@ -38,12 +38,8 @@ STOP_REDIS="${STOP_REDIS:-0}"
 # Gateway 启动脚本写入的 pid 文件。
 GATEWAY_PID_FILE="${GATEWAY_PID_FILE:-${PROJECT_DIR}/gateway.pid}"
 
-# 当前用户能直接使用 docker 就用 docker，否则自动走 sudo docker。
-if docker ps >/dev/null 2>&1; then
-  DOCKER=(docker)
-else
-  DOCKER=(sudo docker)
-fi
+# 统一使用 sudo docker。
+DOCKER=(sudo docker)
 
 log() {
   printf '[stop] %s\n' "$*"
