@@ -73,6 +73,12 @@ APP_MOUNT="${APP_MOUNT:-${PROJECT_DIR}}"
 # 会放在 -v ${APP_MOUNT}:/app 后面，确保覆盖 /app/faceImage。
 FACE_IMAGE_MOUNT="${FACE_IMAGE_MOUNT:-/data/faceImage}"
 
+# 性能耗时统计默认关闭。
+# 启动时设置 ENABLE_PROFILING=1 才会传入算法 Docker。
+# PROFILE_LOG_EVERY 表示每多少个请求打印一次聚合耗时日志。
+ENABLE_PROFILING="${ENABLE_PROFILING:-0}"
+PROFILE_LOG_EVERY="${PROFILE_LOG_EVERY:-100}"
+
 # 启动 Gateway 使用的 Python 命令。如果在 conda 环境里运行脚本，默认 python 即可。
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -273,6 +279,13 @@ start_algorithm_container() {
     -e "ASCEND_DEVICE_ID=${device}"
   )
 
+  if [[ "$ENABLE_PROFILING" == "1" ]]; then
+    docker_args+=(
+      -e ENABLE_PROFILING=1
+      -e "PROFILE_LOG_EVERY=${PROFILE_LOG_EVERY}"
+    )
+  fi
+
   for ((worker_index = 0; worker_index < WORKERS_PER_DOCKER; worker_index++)); do
     port="$(port_for_worker "$device_index" "$worker_index" "${#DEVICES[@]}")"
     docker_args+=(-p "${port}:${port}")
@@ -333,6 +346,10 @@ main() {
   log "workers_per_docker=$WORKERS_PER_DOCKER"
   log "start_port=$START_PORT"
   log "face_image_mount=$FACE_IMAGE_MOUNT"
+  log "enable_profiling=$ENABLE_PROFILING"
+  if [[ "$ENABLE_PROFILING" == "1" ]]; then
+    log "profile_log_every=$PROFILE_LOG_EVERY"
+  fi
 
   start_redis
   generate_gateway_config
