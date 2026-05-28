@@ -61,6 +61,42 @@ container_exists() {
   "${DOCKER[@]}" ps -a --format '{{.Names}}' | grep -Fxq "$name"
 }
 
+find_gateway_pids() {
+  ps -eo pid=,args= \
+    | awk -v port="$GATEWAY_PORT" '
+        /uvicorn/ && /gateway_server:app/ && $0 ~ "--port " port {
+          print $1
+        }
+      ' \
+    | grep -v "^$$$" || true
+}
+
+kill_pids() {
+  local label="$1"
+  shift
+  local pids=("$@")
+  if [[ "${#pids[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  log "stopping ${label}: ${pids[*]}"
+  kill "${pids[@]}" >/dev/null 2>&1 || true
+  sleep 2
+
+  local alive=()
+  local pid
+  for pid in "${pids[@]}"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      alive+=("$pid")
+    fi
+  done
+
+  if [[ "${#alive[@]}" -gt 0 ]]; then
+    log "force stopping ${label}: ${alive[*]}"
+    kill -9 "${alive[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
 # 解析 NPU_DEVICES，例如 "0,1,2" -> DEVICES=(0 1 2)。
 parse_devices() {
   IFS=',' read -r -a RAW_DEVICES <<< "$NPU_DEVICES"
@@ -80,19 +116,14 @@ stop_gateway() {
     local pid
     pid="$(cat "$GATEWAY_PID_FILE" 2>/dev/null || true)"
     if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
-      log "stopping gateway pid=$pid"
-      kill "$pid" >/dev/null 2>&1 || true
-      sleep 2
-      if kill -0 "$pid" >/dev/null 2>&1; then
-        kill -9 "$pid" >/dev/null 2>&1 || true
-      fi
+      kill_pids "gateway pid file process" "$pid"
     fi
     rm -f "$GATEWAY_PID_FILE"
   fi
 
   log "stopping gateway processes on port ${GATEWAY_PORT}"
-  pkill -f "uvicorn gateway_server:app.*--port ${GATEWAY_PORT}" >/dev/null 2>&1 || true
-  pkill -f "python.*uvicorn gateway_server:app.*--port ${GATEWAY_PORT}" >/dev/null 2>&1 || true
+  mapfile -t gateway_pids < <(find_gateway_pids)
+  kill_pids "gateway processes" "${gateway_pids[@]}"
 }
 
 # 删除算法 Docker 容器。
