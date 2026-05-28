@@ -18,7 +18,7 @@ set -euo pipefail
 #   STOP_REDIS=1 ./stop_all_services.sh
 
 # 项目目录，用于找到 gateway.pid。
-PROJECT_DIR="${PROJECT_DIR:-/home/wangchenhao/PersonTracking_update}"
+PROJECT_DIR="${PROJECT_DIR:-/home/wangchenhao/PersonTracking_om_test}"
 
 # 要关闭哪些 NPU 对应的算法容器，必须和启动时的 NPU_DEVICES 一致。
 NPU_DEVICES="${NPU_DEVICES:-0,1}"
