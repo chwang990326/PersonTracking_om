@@ -14,6 +14,7 @@ from torch.nn import ReLU, Sigmoid
 from torch.nn import Module
 from torch.nn import PReLU
 
+
 def build_model(model_name='ir_50'):
     if model_name == 'ir_101':
         return IR_101(input_size=(112, 112))

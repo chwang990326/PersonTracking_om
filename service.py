@@ -21,7 +21,6 @@ from models.posture_classifier import classify_posture_with_verification
 from models.personReID import PersonReidentifier
 from models.face import FaceRecognizer
 from models.unknown_entity_store import UnknownEntityStore
-from models.redis_identity_memory import RedisIdentityMemory, RedisUnavailableError
 from utils.get_model import getmodel
 from models.actionclassifier import preprocess_crops_for_video_cls, postprocess, crop_and_pad
 # [新增] 导入特征提取器类
@@ -45,12 +44,12 @@ class CameraConfigError(RuntimeError):
 class VisionAnalysisService:
     def __init__(self):
         print(">>> 正在初始化视觉分析服务...")
-
+        
         # 1. 基础路径配置
         self.config_base_path = 'config'
         self.order_config_path = 'config/caculate_order.yaml'
-        self.identity_folder = 'identity'
-
+        self.identity_folder = 'identity' # [显式定义]
+        
         # 2. 加载共享模型
         self.using_om_models = any(
             is_om_path(path)
@@ -66,23 +65,12 @@ class VisionAnalysisService:
         self.yolo_device = 'cpu' if self.using_om_models else (0 if (self.device.type == 'cuda' or yolo_cuda_available) else 'cpu')
         print(f">>> 行为识别模型将使用设备: {self.device}")
         self.pose_path = POSE_ONNX_PATH
-
-        # 3. 初始化 Redis 中央身份记忆库
-        print(">>> 初始化 Redis 中央身份记忆库...")
-        self.redis_memory = RedisIdentityMemory()
-        if self.redis_memory.connect():
-            try:
-                self.redis_memory.ensure_indexes()
-                print(">>> Redis 中央身份记忆库就绪")
-            except RedisUnavailableError as e:
-                print(f">>> [FATAL] Redis 向量检索不可用: {e}")
-                raise
-        else:
-            print(">>> [FATAL] Redis 连接失败，服务无法启动")
-            raise RedisUnavailableError("Redis 不可用，无法初始化中央身份记忆库")
-
+        
         print(">>> 加载 YOLO & Pose 模型...")
+        
         self.phone_detector = create_yolo_model(PHONE_DETECTOR_ONNX_PATH, task='detect')
+        
+        # [新增] 初始化共享的 ReID 特征提取模型 (只加载一次，节省显存并避免配置冲突)
         print(">>> 加载 ReID 特征提取模型 (共享)...")
         self.shared_reid_extractor = PersonViTFeatureExtractor(
             model_path=REID_MODEL_PATH,
@@ -90,26 +78,35 @@ class VisionAnalysisService:
             device=str(self.device)
         )
         self.shared_identity_store = self._create_shared_identity_store()
+        
+        # [新增] 全局未知 ID 管理 (0-99 空闲复用)
+        self.id_lock = threading.Lock()
+        self.TEMP_ID_START = 0
+        self.TEMP_ID_END = 99
 
         print(">>> 加载行为识别模型...")
+        # 加载 Uniformer 模型
         self.action_model_path = ACTION_MODEL_PATH
         self.action_model = None
         self.action_model_lock = threading.Lock()
         print(">>> UniFormer 行为识别模型按需加载，默认不初始化")
         self.PHONE_CONFIDENCE_THRESHOLD = 0.8
         self.phone_detect_interval = 5
-        self.action_infer_interval = 1
+        # 推理间隔保持为4帧（即每隔4帧，取过去16帧进行一次识别，形成滑动窗口）
+        # [修改] 将原先的 2 改为 1，实现逐帧平滑判断，与 OM 逻辑对齐
+        self.action_infer_interval = 1 
         self.v_max_mmps = 6000.0
         self.margin_mm = 100.0
         self.deadband_mm = 30.0
         self.ttl_keep_state = 1.0
         self.outlier_confirm = 2
 
+        # [新增] 行为识别动态阈值配置
         self.ACTION_THRESHOLDS = {
             'climbing': 0.85,
             'falling_down': 0.0,
-            'smoking': 0.85,
-            'reaching_high': 0.85,
+            'smoking': 0.85,      # 假设标签名为 smoking
+            'reaching_high': 0.85, # 假设标签名为 reaching_high
             'sleeping': 0.8,
         }
 
@@ -121,8 +118,7 @@ class VisionAnalysisService:
             architecture='ir_50',
             similarity_threshold=0.5,
             detection_threshold=0.7,
-            db_path='./database/face_database',
-            redis_memory=self.redis_memory,
+            db_path='./database/face_database'
         )
         self.image_face_recognizer = FaceRecognizer(
             face_gallery_path='faceImage',
@@ -131,11 +127,14 @@ class VisionAnalysisService:
             architecture='ir_50',
             similarity_threshold=0.35,
             detection_threshold=0.3,
-            db_path='./database/face_database',
-            redis_memory=self.redis_memory,
+            db_path='./database/face_database'
         )
         self.shared_unknown_store = UnknownEntityStore(
-            redis_memory=self.redis_memory,
+            face_folder='unknownFace',
+            reid_folder='unknownIdentity',
+            face_db_path='./database/unknown_face_database',
+            temp_id_start=self.TEMP_ID_START,
+            temp_id_end=self.TEMP_ID_END,
             ttl_seconds=300.0,
             face_similarity_threshold=self.shared_face_recognizer.similarity_threshold,
         )
@@ -145,20 +144,21 @@ class VisionAnalysisService:
         self.camera_states_lock = threading.Lock()
         self.camera_params_cache = {}
         self.camera_params_lock = threading.Lock()
-        self.FACE_CONFIRM_THRESHOLD = 3
+        self.FACE_CONFIRM_THRESHOLD = 3  # 确认人脸识别结果需要连续出现的次数
         self.identity_refresh_interval = 100.0
         self.identity_refresh_lock = threading.Lock()
         self.last_identity_refresh_check = 0.0
         print(">>> 服务初始化完成。")
 
+    # [新增] 线程安全的 ID 生成器回调函数
     def _generate_next_global_id(self):
-        return self.shared_unknown_store.allocate_id()
+        with self.id_lock:
+            return self.shared_unknown_store.allocate_id()
 
     def _create_shared_identity_store(self):
         return SharedIdentityStore(
             identity_folder=self.identity_folder,
-            feature_extractor=self.shared_reid_extractor,
-            redis_memory=self.redis_memory,
+            feature_extractor=self.shared_reid_extractor
         )
 
     def _get_action_model(self):
@@ -185,22 +185,8 @@ class VisionAnalysisService:
     def _is_temporary_identity(person_id):
         """
         判断一个 person_id 是否属于临时未知 ID 的范围。
-        支持旧数字格式（兼容）和新 UUID hex 格式。
         """
-        if person_id in (None, '', -1):
-            return False
-        if isinstance(person_id, int):
-            return True
-        if isinstance(person_id, str):
-            if person_id.isdigit():
-                return True
-            # unknown:UUID (如 unknown:a1b2c3d4...)
-            if person_id.startswith("unknown:"):
-                return True
-            # 纯 UUID hex（兼容旧格式）
-            if len(person_id) == 32 and all(c in '0123456789abcdef' for c in person_id):
-                return True
-        return False
+        return isinstance(person_id, int) or (isinstance(person_id, str) and person_id.isdigit())
 
     def _is_strict_unknown_face_ready(self, kp_data):
         """
@@ -475,8 +461,7 @@ class VisionAnalysisService:
                         feature_extractor=self.shared_reid_extractor, # [修改] 传入共享模型
                         id_generator=self._generate_next_global_id,   # [新增] 传入全局
                         shared_identity_store=self.shared_identity_store,
-                        shared_unknown_store=self.shared_unknown_store,
-                        redis_memory=self.redis_memory,
+                        shared_unknown_store=self.shared_unknown_store
                     ),
                     # [修改] video_cache 长度改为 16，适配新的 Uniformer 输入要求
                     'video_cache': defaultdict(lambda: deque(maxlen=16)),
@@ -808,7 +793,6 @@ class VisionAnalysisService:
                                         frame_shape=frame.shape,
                                         all_boxes=boxes,
                                         current_idx=current_idx,
-                                        keypoints=kp_data,
                                     )
                 profiler.stop("10_Face_Recognition")
 
@@ -932,8 +916,7 @@ class VisionAnalysisService:
                 architecture='ir_50',
                 similarity_threshold=0.45,
                 detection_threshold=0.65,
-                db_path='./database/face_database',
-                redis_memory=self.redis_memory,
+                db_path='./database/face_database'
             )
             self.image_face_recognizer = FaceRecognizer(
                 face_gallery_path='faceImage',
@@ -942,8 +925,7 @@ class VisionAnalysisService:
                 architecture='ir_50',
                 similarity_threshold=0.35,
                 detection_threshold=0.3,
-                db_path='./database/face_database',
-                redis_memory=self.redis_memory,
+                db_path='./database/face_database'
             )
             self._refresh_identity_store_if_needed(force=True)
             self.shared_unknown_store.clear_all()
