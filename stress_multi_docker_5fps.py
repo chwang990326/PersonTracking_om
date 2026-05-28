@@ -1,14 +1,13 @@
 """
-Stress test multiple single-worker Docker instances with fixed camera routing.
+Stress test the Gateway endpoint with fixed camera IDs.
 
 The script reuses one source video for simulated cameras. Each camera sends at
-a fixed cadence without waiting for previous responses, and each camera is
-routed to a Docker instance by a stable round-robin rule:
-
-    camera_index % docker_count -> port 8130 + index
+a fixed cadence without waiting for previous responses. All requests are sent
+to the Gateway; Redis/Gateway decides which backend pipeline handles each
+camera_id.
 
 Example:
-    python stress_multi_docker_5fps.py --docker-count 3 --camera-range 201-210
+    python stress_multi_docker_5fps.py --api-url http://127.0.0.1:8130/api/v1/person/detect --camera-range 201-210
 """
 
 from __future__ import annotations
@@ -27,8 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 
-DEFAULT_HOST = "http://192.168.100.64"
-DEFAULT_START_PORT = 8130
+DEFAULT_API_URL = "http://127.0.0.1:8130/api/v1/person/detect"
 DEFAULT_VIDEO_PATH = "video/test1.mp4"
 DEFAULT_CAMERA_RANGE = "201-210"
 DEFAULT_TARGET_FPS = 5.0
@@ -54,14 +52,14 @@ class EncodedFrame:
 @dataclass
 class CameraRoute:
     camera_id: str
-    docker_index: int
+    target: str
     url: str
 
 
 @dataclass
 class RequestRecord:
     camera_id: str
-    docker_index: int
+    target: str
     url: str
     stage_camera_count: int
     sequence: int
@@ -92,7 +90,7 @@ class StageMetrics:
     api_errors: int = 0
     latencies_ms: List[float] = field(default_factory=list)
     per_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    per_docker: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    per_target: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def avg_latency_ms(self) -> float:
@@ -119,19 +117,24 @@ class StageMetrics:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run staged 5 FPS stress tests against multiple Docker ports. "
+            "Run staged 5 FPS stress tests against the Gateway endpoint. "
             "Camera IDs and camera counts are configurable."
         )
     )
-    parser.add_argument("--docker-count", type=int, required=True, help="Number of Docker instances/ports to route to")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="Base host, e.g. http://192.168.100.64")
-    parser.add_argument("--start-port", type=int, default=DEFAULT_START_PORT, help="First Docker host port")
-    parser.add_argument("--api-path", default="/api/v1/person/detect", help="API path")
+    parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Gateway API URL")
+    parser.add_argument("--docker-count", type=int, default=0, help="Deprecated; ignored. Gateway handles routing.")
+    parser.add_argument("--host", default="", help="Deprecated; ignored. Use --api-url instead.")
+    parser.add_argument("--start-port", type=int, default=0, help="Deprecated; ignored. Use --api-url instead.")
+    parser.add_argument("--api-path", default="", help="Deprecated; ignored. Use --api-url instead.")
     parser.add_argument("--video-path", default=DEFAULT_VIDEO_PATH, help="Source video reused by every camera")
     parser.add_argument(
         "--camera-range",
         default=DEFAULT_CAMERA_RANGE,
-        help="Camera ID range, e.g. 201-210, 301-310, 101-110. Ignored when --camera-ids is set.",
+        help=(
+            "Camera ID range, e.g. 201-210, 301-310, 101-110. "
+            "Multiple ranges are allowed, e.g. 201-210,301-305. "
+            "Ignored when --camera-ids is set."
+        ),
     )
     parser.add_argument(
         "--camera-ids",
@@ -194,25 +197,36 @@ def get_session(trust_env_proxy: bool):
     return session
 
 
-def normalize_host(host: str) -> str:
-    host = host.rstrip("/")
-    if not host.startswith(("http://", "https://")):
-        host = "http://" + host
-    return host
+def normalize_api_url(api_url: str) -> str:
+    url = str(api_url).strip()
+    if not url:
+        raise ValueError("--api-url cannot be empty")
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
 
 
 def parse_camera_range(raw: str) -> List[str]:
     value = str(raw).strip()
     if not value:
         raise ValueError("--camera-range cannot be empty")
-    if "-" not in value:
-        return [value]
 
-    start_raw, end_raw = value.split("-", 1)
-    start = int(start_raw.strip())
-    end = int(end_raw.strip())
-    step = 1 if end >= start else -1
-    return [str(camera_id) for camera_id in range(start, end + step, step)]
+    camera_ids: List[str] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" not in item:
+            camera_ids.append(item)
+            continue
+
+        start_raw, end_raw = item.split("-", 1)
+        start = int(start_raw.strip())
+        end = int(end_raw.strip())
+        step = 1 if end >= start else -1
+        camera_ids.extend(str(camera_id) for camera_id in range(start, end + step, step))
+
+    return camera_ids
 
 
 def parse_camera_ids(args: argparse.Namespace) -> List[str]:
@@ -229,16 +243,13 @@ def parse_camera_ids(args: argparse.Namespace) -> List[str]:
 
 
 def build_routes(args: argparse.Namespace, camera_ids: Sequence[str]) -> Dict[str, CameraRoute]:
-    host = normalize_host(args.host)
-    api_path = args.api_path if args.api_path.startswith("/") else "/" + args.api_path
+    api_url = normalize_api_url(args.api_url)
     routes: Dict[str, CameraRoute] = {}
-    for index, camera_id in enumerate(camera_ids):
-        docker_index = index % args.docker_count
-        port = args.start_port + docker_index
+    for camera_id in camera_ids:
         routes[camera_id] = CameraRoute(
             camera_id=camera_id,
-            docker_index=docker_index,
-            url=f"{host}:{port}{api_path}",
+            target="gateway",
+            url=api_url,
         )
     return routes
 
@@ -317,7 +328,7 @@ def post_frame(
     started_at = time.perf_counter()
     record = RequestRecord(
         camera_id=route.camera_id,
-        docker_index=route.docker_index,
+        target=route.target,
         url=route.url,
         stage_camera_count=stage_camera_count,
         sequence=camera_sequence,
@@ -382,7 +393,7 @@ def record_metrics(metrics: StageMetrics, record: RequestRecord) -> None:
             metrics.dropped_api += 1
 
     update_bucket(metrics.per_camera.setdefault(record.camera_id, {}), record)
-    update_bucket(metrics.per_docker.setdefault(str(record.docker_index), {}), record)
+    update_bucket(metrics.per_target.setdefault(record.target, {}), record)
 
 
 def percentile(values: Sequence[float], pct: float) -> float:
@@ -488,9 +499,9 @@ def run_stage(
         camera_id: summarize_bucket(bucket)
         for camera_id, bucket in metrics.per_camera.items()
     }
-    metrics.per_docker = {
-        docker_index: summarize_bucket(bucket)
-        for docker_index, bucket in metrics.per_docker.items()
+    metrics.per_target = {
+        target: summarize_bucket(bucket)
+        for target, bucket in metrics.per_target.items()
     }
     return metrics
 
@@ -515,7 +526,7 @@ def metrics_to_jsonable(metrics: StageMetrics) -> Dict[str, Any]:
         "api_errors": metrics.api_errors,
         "dropped_api_1203": metrics.dropped_api,
         "per_camera": metrics.per_camera,
-        "per_docker": metrics.per_docker,
+        "per_target": metrics.per_target,
     }
 
 
@@ -542,7 +553,7 @@ def make_run_dir(args: argparse.Namespace) -> Path:
     output_dir = Path(args.output_dir)
     run_name = args.run_name
     if not run_name:
-        run_name = datetime.now().strftime("multi_docker_stress_%Y%m%d_%H%M%S")
+        run_name = datetime.now().strftime("gateway_stress_%Y%m%d_%H%M%S")
     run_dir = output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
@@ -554,8 +565,6 @@ def main() -> None:
     if args.max_cameras == 0:
         args.max_cameras = len(camera_ids)
 
-    if args.docker_count <= 0:
-        raise ValueError("--docker-count must be positive")
     if args.target_fps <= 0:
         raise ValueError("--target-fps must be positive")
     if args.start_cameras < 1 or args.max_cameras > len(camera_ids):
@@ -575,7 +584,7 @@ def main() -> None:
     records_path = run_dir / "requests.jsonl"
     summary_path = run_dir / "summary.json"
 
-    print(f"host={normalize_host(args.host)} start_port={args.start_port} docker_count={args.docker_count}")
+    print(f"api_url={normalize_api_url(args.api_url)}")
     print(f"video_path={video_path} preloaded_frames={len(frames)} target_fps={args.target_fps}")
     print(f"stage_seconds={args.stage_seconds} warmup_seconds={args.warmup_seconds}")
     print(f"camera_ids={','.join(camera_ids)}")
@@ -583,7 +592,7 @@ def main() -> None:
     print("camera routing:")
     for camera_id in camera_ids:
         route = routes[camera_id]
-        print(f"  camera_id={camera_id} -> docker_index={route.docker_index} url={route.url}")
+        print(f"  camera_id={camera_id} -> target={route.target} url={route.url}")
     print(f"run_dir={run_dir}")
 
     results: List[StageMetrics] = []
@@ -599,10 +608,7 @@ def main() -> None:
             jsonl_handle.close()
 
     summary = {
-        "host": normalize_host(args.host),
-        "start_port": args.start_port,
-        "docker_count": args.docker_count,
-        "api_path": args.api_path,
+        "api_url": normalize_api_url(args.api_url),
         "video_path": str(video_path),
         "target_fps": args.target_fps,
         "stage_seconds": args.stage_seconds,
