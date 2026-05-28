@@ -57,7 +57,7 @@ class DetectResponseData(BaseModel):
 class BaseResponse(BaseModel):
     code: int
     message: str
-    data: Optional[DetectResponseData] = None
+    data: Optional[object] = None
     timestamp: int
 
 
@@ -310,18 +310,21 @@ async def face_refresh():
     """
     3.4 加载人脸库接口
     """
-    success = service.reload_library()
+    result = service.reload_library()
+    success = result.get("success", False) if isinstance(result, dict) else bool(result)
     
     if success:
         return BaseResponse(
             code=0,
             message="加载成功",
+            data=result if isinstance(result, dict) else None,
             timestamp=get_current_timestamp()
         )
     else:
         return BaseResponse(
             code=1201, # 业务逻辑错误
-            message="加载失败",
+            message=result.get("error", "加载失败") if isinstance(result, dict) else "加载失败",
+            data=result if isinstance(result, dict) else None,
             timestamp=get_current_timestamp()
         )
 
@@ -372,5 +375,5 @@ async def third_face_verify(request: ThirdFaceVerifyRequest):
 
 if __name__ == "__main__":
     # 启动服务
-    uvicorn.run(app, host="0.0.0.0", port=8135)
+    uvicorn.run(app, host="0.0.0.0", port=8136)
 

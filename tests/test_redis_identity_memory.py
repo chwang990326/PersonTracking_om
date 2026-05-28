@@ -1,6 +1,6 @@
 """Unit tests for RedisIdentityMemory module.
 
-Requires a real Redis 8 instance at 127.0.0.1:6379 with RediSearch.
+Requires a real Redis 8 instance at 127.0.0.1:6379.
 Tests use the isolated prefix `test_pt` – no production data is touched.
 """
 
@@ -114,14 +114,13 @@ class TestEmbeddingSerialization:
 class TestUnknownIDAllocation:
     """Unknown ID allocation tests."""
 
-    def test_allocate_id_returns_unique_uuid(self, redis_memory):
+    def test_allocate_id_returns_global_numeric_id(self, redis_memory):
         id1 = redis_memory.allocate_unknown_id()
         id2 = redis_memory.allocate_unknown_id()
-        # unknown:UUID strings: "unknown:" prefix + 32 hex chars
         assert isinstance(id1, str)
         assert isinstance(id2, str)
-        assert id1.startswith("unknown:") and len(id1) == 40
-        assert id2.startswith("unknown:") and len(id2) == 40
+        assert id1.isdigit() and int(id1) >= 1000000
+        assert id2.isdigit() and int(id2) >= 1000000
         assert id1 != id2
 
     def test_allocate_id_creates_entity(self, redis_memory):
@@ -289,12 +288,12 @@ class TestFindOrCreateUnknown:
     def test_find_or_create_new_when_no_match(self, redis_memory, reid_embedding):
         result = redis_memory.find_or_create_unknown(reid_embedding, 0.99, "reid")
         assert isinstance(result, str)
-        assert result.startswith("unknown:") and len(result) == 40
+        assert result.isdigit() and int(result) >= 1000000
 
     def test_allocate_id_basic(self, redis_memory):
         uid = redis_memory.allocate_unknown_id()
         assert isinstance(uid, str)
-        assert uid.startswith("unknown:") and len(uid) == 40
+        assert uid.isdigit() and int(uid) >= 1000000
 
     def test_find_or_create_face(self, redis_memory, face_embedding):
         uid = redis_memory.allocate_unknown_id()

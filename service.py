@@ -21,6 +21,8 @@ from models.posture_classifier import classify_posture_with_verification
 from models.personReID import PersonReidentifier
 from models.face import FaceRecognizer
 from models.unknown_entity_store import UnknownEntityStore
+from models.redis_identity_memory import RedisIdentityMemory
+from models.local_identity_index import LocalIdentityCache
 from utils.get_model import getmodel
 from models.actionclassifier import preprocess_crops_for_video_cls, postprocess, crop_and_pad
 # [新增] 导入特征提取器类
@@ -49,6 +51,12 @@ class VisionAnalysisService:
         self.config_base_path = 'config'
         self.order_config_path = 'config/caculate_order.yaml'
         self.identity_folder = 'identity' # [显式定义]
+
+        print(">>> 连接 Redis 身份记忆库...")
+        self.redis_memory = RedisIdentityMemory()
+        if not self.redis_memory.connect():
+            raise RuntimeError("Redis 身份记忆库不可用，服务启动失败")
+        self.identity_cache = LocalIdentityCache(self.redis_memory, sync_interval=0.75)
         
         # 2. 加载共享模型
         self.using_om_models = any(
@@ -79,7 +87,7 @@ class VisionAnalysisService:
         )
         self.shared_identity_store = self._create_shared_identity_store()
         
-        # [新增] 全局未知 ID 管理 (0-99 空闲复用)
+        # Redis 负责全局 unknown ID 分配；以下范围仅作为 Redis 不可用时的兼容 fallback。
         self.id_lock = threading.Lock()
         self.TEMP_ID_START = 0
         self.TEMP_ID_END = 99
@@ -118,7 +126,9 @@ class VisionAnalysisService:
             architecture='ir_50',
             similarity_threshold=0.5,
             detection_threshold=0.7,
-            db_path='./database/face_database'
+            db_path='./database/face_database',
+            identity_cache=self.identity_cache,
+            redis_memory=self.redis_memory,
         )
         self.image_face_recognizer = FaceRecognizer(
             face_gallery_path='faceImage',
@@ -127,8 +137,11 @@ class VisionAnalysisService:
             architecture='ir_50',
             similarity_threshold=0.35,
             detection_threshold=0.3,
-            db_path='./database/face_database'
+            db_path='./database/face_database',
+            identity_cache=self.identity_cache,
+            redis_memory=self.redis_memory,
         )
+        self._publish_known_faces_to_redis()
         self.shared_unknown_store = UnknownEntityStore(
             face_folder='unknownFace',
             reid_folder='unknownIdentity',
@@ -137,6 +150,8 @@ class VisionAnalysisService:
             temp_id_end=self.TEMP_ID_END,
             ttl_seconds=300.0,
             face_similarity_threshold=self.shared_face_recognizer.similarity_threshold,
+            redis_memory=self.redis_memory,
+            identity_cache=self.identity_cache,
         )
 
         # 相机状态管理
@@ -158,8 +173,18 @@ class VisionAnalysisService:
     def _create_shared_identity_store(self):
         return SharedIdentityStore(
             identity_folder=self.identity_folder,
-            feature_extractor=self.shared_reid_extractor
+            feature_extractor=self.shared_reid_extractor,
+            redis_memory=self.redis_memory,
+            identity_cache=self.identity_cache,
         )
+
+    def _publish_known_faces_to_redis(self):
+        if self.redis_memory is None or not self.redis_memory.available:
+            return 0
+        entries = self.shared_face_recognizer.export_known_face_entries()
+        count = self.redis_memory.replace_known_faces(entries)
+        self.identity_cache.force_sync("known_face")
+        return count
 
     def _get_action_model(self):
         if self.action_model is not None:
@@ -223,7 +248,7 @@ class VisionAnalysisService:
         for bbox, kps in zip(bboxes, kpss):
             try:
                 embedding = self.shared_face_recognizer.recognizer.get_embedding(person_crop, kps)
-                person_id, similarity = self.shared_face_recognizer.face_db.search(
+                person_id, similarity = self.shared_face_recognizer.search_known_face(
                     embedding,
                     self.shared_face_recognizer.similarity_threshold,
                 )
@@ -461,7 +486,9 @@ class VisionAnalysisService:
                         feature_extractor=self.shared_reid_extractor, # [修改] 传入共享模型
                         id_generator=self._generate_next_global_id,   # [新增] 传入全局
                         shared_identity_store=self.shared_identity_store,
-                        shared_unknown_store=self.shared_unknown_store
+                        shared_unknown_store=self.shared_unknown_store,
+                        identity_cache=self.identity_cache,
+                        redis_memory=self.redis_memory,
                     ),
                     # [修改] video_cache 长度改为 16，适配新的 Uniformer 输入要求
                     'video_cache': defaultdict(lambda: deque(maxlen=16)),
@@ -506,8 +533,9 @@ class VisionAnalysisService:
             camera_id = "default"
 
         with profiler.section("4_State_And_Config"):
+            with profiler.section("4a_Identity_Cache_Sync"):
+                self.identity_cache.maybe_sync()
             self._refresh_identity_store_if_needed()
-            self.shared_unknown_store.cleanup_stale()
             camera_params = self.get_camera_params(camera_id)
 
             state = self.get_camera_state(camera_id)
@@ -572,7 +600,6 @@ class VisionAnalysisService:
                 state['phone_frame_counter'] = 0
             if enable_tracking:
                 reidentifier.refresh_track_state([])
-            self.shared_unknown_store.cleanup_stale()
             self._cleanup_stale_track_states(track_filter_states, current_time_sec, self.ttl_keep_state)
             return False, []
 
@@ -766,7 +793,12 @@ class VisionAnalysisService:
                                 self.shared_unknown_store.touch_entity(person_id)
                                 id_resource = "face"
                             elif person_id == -1:
-                                allocated_id = self._generate_next_global_id()
+                                allocated_id, _ = self.shared_unknown_store.claim_by_face(
+                                    unknown_face_candidate['embedding'],
+                                    self.shared_face_recognizer.similarity_threshold,
+                                )
+                                if allocated_id is None:
+                                    allocated_id = self._generate_next_global_id()
                                 if allocated_id != -1:
                                     old_person_id = reidentifier.bind_track_identity(track_id, allocated_id)
                                     if switch_from is None:
@@ -906,8 +938,8 @@ class VisionAnalysisService:
         self._cleanup_stale_track_states(track_filter_states, current_time_sec, self.ttl_keep_state)
         return len(persons_result) > 0, persons_result
 
-    def reload_library(self):
-        """重载人脸库并热更新 ReID 库，保留在线轨迹状态"""
+    def reload_library(self, clear_unknown=False):
+        """重载人脸库并热更新 ReID 库，保留在线轨迹状态。"""
         try:
             self.shared_face_recognizer = FaceRecognizer(
                 face_gallery_path='faceImage',
@@ -916,7 +948,9 @@ class VisionAnalysisService:
                 architecture='ir_50',
                 similarity_threshold=0.45,
                 detection_threshold=0.65,
-                db_path='./database/face_database'
+                db_path='./database/face_database',
+                identity_cache=self.identity_cache,
+                redis_memory=self.redis_memory,
             )
             self.image_face_recognizer = FaceRecognizer(
                 face_gallery_path='faceImage',
@@ -925,14 +959,27 @@ class VisionAnalysisService:
                 architecture='ir_50',
                 similarity_threshold=0.35,
                 detection_threshold=0.3,
-                db_path='./database/face_database'
+                db_path='./database/face_database',
+                identity_cache=self.identity_cache,
+                redis_memory=self.redis_memory,
             )
+            known_face_count = self._publish_known_faces_to_redis()
             self._refresh_identity_store_if_needed(force=True)
-            self.shared_unknown_store.clear_all()
-            return True
+            if clear_unknown:
+                self.shared_unknown_store.clear_all()
+            self.identity_cache.force_sync()
+            versions = self.redis_memory.get_versions()
+            counts = self.identity_cache.loaded_counts()
+            return {
+                "success": True,
+                "versions": versions,
+                "counts": counts,
+                "known_face_imported": known_face_count,
+                "clear_unknown": bool(clear_unknown),
+            }
         except Exception as e:
             print(f"重载失败: {e}")
-            return False
+            return {"success": False, "error": str(e)}
 
     def verify_face_from_image(self, image):
         """
@@ -944,4 +991,5 @@ class VisionAnalysisService:
         if image is None or image.size == 0:
             return None, False
 
+        self.identity_cache.maybe_sync()
         return self.image_face_recognizer.verify_person_id(image)

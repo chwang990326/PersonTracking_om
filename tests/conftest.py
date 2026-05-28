@@ -101,7 +101,8 @@ def known_reid_entries():
 def redis_memory():
     """Create a RedisIdentityMemory connected to real Redis with test prefix."""
     mem = RedisIdentityMemory(config=TEST_CONFIG)
-    assert mem.connect(), "Redis connection failed – is Redis running?"
+    if not mem.connect():
+        pytest.skip("Redis connection failed - is Redis running and is redis-py installed?")
     mem.ensure_indexes()
     _flush_test_prefix(mem)
 

@@ -30,7 +30,9 @@ class PersonReidentifier:
                  feature_extractor=None,
                  id_generator=None,
                  shared_identity_store=None,
-                 shared_unknown_store=None): 
+                 shared_unknown_store=None,
+                 identity_cache=None,
+                 redis_memory=None):
         """
         初始化ReID系统。
 
@@ -96,6 +98,8 @@ class PersonReidentifier:
         self.gallery_lock = threading.RLock()
         self.shared_identity_store = shared_identity_store
         self.shared_unknown_store = shared_unknown_store
+        self.identity_cache = identity_cache
+        self.redis_memory = redis_memory
         
         # 定义临时ID范围
         self.TEMP_ID_START = 0
@@ -207,6 +211,16 @@ class PersonReidentifier:
             self.next_auto_id = self.TEMP_ID_START
         return temp_id
 
+    def _claim_unknown_by_reid(self, feature):
+        if self.shared_unknown_store is not None:
+            unknown_id, similarity = self.shared_unknown_store.claim_by_reid(
+                feature,
+                self.unknown_similarity_threshold,
+            )
+            if unknown_id is not None:
+                return unknown_id, similarity
+        return self._allocate_temporary_id(), 0.0
+
     def refresh_track_state(self, active_track_ids):
         """
         刷新追踪状态，移除长时间未出现的轨迹。
@@ -262,6 +276,10 @@ class PersonReidentifier:
         return self._generate_prefixed_filename(target_dir, 'anchor')
 
     def _get_gallery_features(self, person_id):
+        if self.identity_cache is not None:
+            features = self.identity_cache.get_known_reid_features(person_id)
+            if features is not None and len(features) > 0:
+                return features
         with self.gallery_lock:
             return self.feature_gallery.get(person_id)
 
@@ -270,6 +288,10 @@ class PersonReidentifier:
             return self.anchor_gallery.get(person_id)
 
     def _has_gallery_identity(self, person_id):
+        if self.identity_cache is not None and self._is_known_identity(person_id):
+            features = self.identity_cache.get_known_reid_features(person_id)
+            if features is not None and len(features) > 0:
+                return True
         with self.gallery_lock:
             return self._is_known_identity(person_id) and person_id in self.feature_gallery
 
@@ -285,10 +307,14 @@ class PersonReidentifier:
         """
         获取未知身份库中指定ID的特征向量。
         """
+        if self.identity_cache is not None:
+            features = self.identity_cache.get_unknown_reid_features(person_id)
+            if features is not None and len(features) > 0:
+                return features
         if self.shared_unknown_store is None:
             return None
         with self.shared_unknown_store.lock:
-            return self.shared_unknown_store.reid_feature_gallery.get(person_id)
+            return self.shared_unknown_store.reid_feature_gallery.get(str(person_id))
 
     def _unknown_gallery_items_snapshot(self):
         """
@@ -307,6 +333,7 @@ class PersonReidentifier:
         """
         if self.shared_unknown_store is None:
             return
+        person_id = str(person_id)
         current_feat = feature_vector.reshape(1, -1)
         with self.shared_unknown_store.lock:
             if person_id not in self.shared_unknown_store.reid_feature_gallery:
@@ -322,6 +349,7 @@ class PersonReidentifier:
     def _remove_unknown_gallery_file_entry(self, person_id, filename):
         if self.shared_unknown_store is None:
             return False
+        person_id = str(person_id)
         with self.shared_unknown_store.lock:
             return self._remove_feature_entry(
                 self.shared_unknown_store.reid_feature_gallery,
@@ -331,6 +359,14 @@ class PersonReidentifier:
             )
 
     def _find_best_unknown_match(self, feature):
+        if self.identity_cache is not None:
+            unknown_id, similarity = self.identity_cache.search_unknown_reid(
+                feature,
+                self.unknown_similarity_threshold,
+            )
+            if unknown_id is not None:
+                return str(unknown_id), similarity
+
         best_match_id = None
         best_similarity = 0.0
 
@@ -799,7 +835,7 @@ class PersonReidentifier:
                         self.track_mapper[track_id]['feature'] = feature 
                     elif should_demote:
                         self.track_mapper[track_id]['switch_from'] = current_person_id
-                        current_person_id = self._allocate_temporary_id()
+                        current_person_id, _ = self._claim_unknown_by_reid(feature)
                         self.track_mapper[track_id]['person_id'] = current_person_id
                         self.track_mapper[track_id]['feature'] = feature
                     
@@ -828,9 +864,7 @@ class PersonReidentifier:
                         match_score = best_unknown_similarity
                     else:
                         # 未匹配，分配新临时ID
-                        # [修改] 根据模式调用不同的 ID 获取方式
-                        current_person_id = self._allocate_temporary_id()
-                        match_score = 0.0
+                        current_person_id, match_score = self._claim_unknown_by_reid(feature)
                 
                 # 注册到映射表
                 self.track_mapper[track_id] = {
@@ -851,6 +885,15 @@ class PersonReidentifier:
 
     def _find_best_match_in_gallery(self, feature):
         """辅助函数：在特征库中寻找最佳匹配"""
+        current_threshold = self.known_similarity_threshold
+        if self._gallery_size() > 5:
+            current_threshold += 0.02
+
+        if self.identity_cache is not None:
+            person_id, similarity = self.identity_cache.search_known_reid(feature, current_threshold)
+            if person_id is not None:
+                return str(person_id), similarity
+
         best_match_id = None
         best_similarity = 0.0
         
@@ -859,10 +902,6 @@ class PersonReidentifier:
             similarity = self._compute_similarity(feature, gallery_features)
             
             # 动态阈值
-            current_threshold = self.known_similarity_threshold
-            if self._gallery_size() > 5: 
-                current_threshold += 0.02
-
             if similarity >= current_threshold and similarity > best_similarity:
                 best_match_id = person_id
                 best_similarity = similarity
@@ -982,16 +1021,25 @@ class PersonReidentifier:
         if not self._check_basic_image_quality(image):
             return False
 
+        person_id = str(person_id)
         feature_vec = self.track_mapper[track_id]['feature'].copy()
+        existing_files = list(self.shared_unknown_store.reid_gallery_files.get(person_id, []))
         current_features = self._get_unknown_gallery_features(person_id)
         if current_features is not None and len(current_features) > 0:
             sim = self._compute_similarity(feature_vec, current_features)
-            if sim > self.TEMP_ID_DEDUP_THRESHOLD:
+            if sim > self.TEMP_ID_DEDUP_THRESHOLD and existing_files:
                 return False
 
-        target_dir = os.path.join(self.shared_unknown_store.reid_folder, str(person_id))
+        redis_entry = None
+        if self.redis_memory is not None and getattr(self.redis_memory, "available", False):
+            try:
+                redis_entry = self.redis_memory.add_unknown_reid_sample(person_id, feature_vec)
+            except Exception as e:
+                print(f"[ReID] Redis unknown_reid 写入失败: {e}")
+                return False
+
+        target_dir = os.path.join(self.shared_unknown_store.reid_folder, person_id)
         os.makedirs(target_dir, exist_ok=True)
-        existing_files = list(self.shared_unknown_store.reid_gallery_files.get(person_id, []))
         if len(existing_files) >= self.MAX_UNKNOWN_REID_IMAGES:
             oldest = existing_files[0]
             oldest_path = os.path.join(target_dir, oldest)
@@ -1003,6 +1051,16 @@ class PersonReidentifier:
         save_path = os.path.join(target_dir, filename)
         cv2.imwrite(save_path, image)
         self._append_unknown_gallery_file_entry(person_id, filename, feature_vec)
+        if self.identity_cache is not None and redis_entry:
+            try:
+                self.identity_cache.add_local_unknown_reid(
+                    person_id,
+                    feature_vec,
+                    sample_key=redis_entry.get("sample_key") if isinstance(redis_entry, dict) else None,
+                    expires_at=redis_entry.get("expires_at") if isinstance(redis_entry, dict) else None,
+                )
+            except Exception as e:
+                print(f"[ReID] 本地 unknown_reid 索引更新失败: {e}")
         return True
 
     def _cleanup_temp_identities(self, max_days=1):
@@ -1262,6 +1320,33 @@ class PersonReidentifier:
             if sim > self.ANCHOR_DIVERSITY_THRESHOLD:
                 print(f"[ReID] 锚点去重拦截: ID {person_id} 相似度 {sim:.3f} > {self.ANCHOR_DIVERSITY_THRESHOLD}，冗余锚点")
                 return False
+
+        if self.redis_memory is not None and getattr(self.redis_memory, "available", False):
+            try:
+                entry = self.redis_memory.add_known_reid_online_sample(
+                    str(person_id),
+                    feature_vector,
+                    is_anchor=True,
+                    ttl_seconds=86400,
+                )
+                if entry and self.identity_cache is not None:
+                    self.identity_cache.add_local_known_reid(
+                        str(person_id),
+                        feature_vector,
+                        sample_key=entry.get("sample_key"),
+                        is_anchor=True,
+                        expires_at=entry.get("expires_at"),
+                    )
+                self._append_gallery_file_entry(
+                    person_id,
+                    f"online_anchor_{int(time.time() * 1000)}.jpg",
+                    feature_vector,
+                    is_anchor=True,
+                )
+                print(f"[ReID] 在线锚点已写入 Redis known_reid_online: ID {person_id}")
+                return True
+            except Exception as e:
+                print(f"[ReID] 在线锚点写入 Redis 失败，回退到本地磁盘保存: {e}")
         
         # --- [需求1: 独立容量限制] 最多 MAX_ANCHOR_IMAGES 张，超出删最早的 ---
         os.makedirs(target_dir, exist_ok=True)

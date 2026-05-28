@@ -8,9 +8,11 @@ import cv2
 class SharedIdentityStore:
     """Service-level shared gallery state for all camera-local reidentifiers."""
 
-    def __init__(self, identity_folder, feature_extractor):
+    def __init__(self, identity_folder, feature_extractor, redis_memory=None, identity_cache=None):
         self.identity_folder = identity_folder
         self.feature_extractor = feature_extractor
+        self.redis_memory = redis_memory
+        self.identity_cache = identity_cache
         self.lock = threading.RLock()
         self.feature_gallery = {}
         self.anchor_gallery = {}
@@ -136,6 +138,32 @@ class SharedIdentityStore:
             self.anchor_files.update(anchor_files)
             self._last_signature = signature
 
+    @staticmethod
+    def _entries_from_gallery(gallery, gallery_files):
+        entries = []
+        for person_id, features in gallery.items():
+            filenames = list(gallery_files.get(person_id, []))
+            for idx, feature in enumerate(features):
+                filename = filenames[idx] if idx < len(filenames) else f"sample_{idx}.jpg"
+                entries.append({
+                    "person_id": str(person_id),
+                    "embedding": feature,
+                    "filename": filename,
+                    "is_anchor": filename.startswith("anchor_"),
+                })
+        return entries
+
+    def _publish_known_reid_base(self, gallery, gallery_files, signature):
+        if self.redis_memory is None or not getattr(self.redis_memory, "available", False):
+            return
+        entries = self._entries_from_gallery(gallery, gallery_files)
+        try:
+            self.redis_memory.replace_known_reid_base(entries, signature=repr(signature))
+            if self.identity_cache is not None:
+                self.identity_cache.force_sync("known_reid")
+        except Exception as e:
+            print(f"[ReID] Redis known_reid_base 同步失败: {e}")
+
     def reload(self, verbose=True):
         entries = self.scan_identity_entries(self.identity_folder)
         signature = self.signature_from_entries(entries)
@@ -145,6 +173,7 @@ class SharedIdentityStore:
             verbose=verbose,
         )
         self._apply_gallery_state(gallery, anchor_gallery, gallery_files, anchor_files, signature)
+        self._publish_known_reid_base(gallery, gallery_files, signature)
 
         if not gallery:
             print("[ReID] 警告: 特征画廊为空，将无法识别任何人。请检查'identity'文件夹结构。")
@@ -165,6 +194,7 @@ class SharedIdentityStore:
             verbose=verbose,
         )
         self._apply_gallery_state(gallery, anchor_gallery, gallery_files, anchor_files, signature)
+        self._publish_known_reid_base(gallery, gallery_files, signature)
 
         if not gallery:
             print("[ReID] 警告: 特征画廊为空，将无法识别任何人。请检查'identity'文件夹结构。")
