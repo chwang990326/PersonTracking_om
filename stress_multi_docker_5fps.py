@@ -1,15 +1,14 @@
 """
 Stress test multiple single-worker Docker instances with fixed camera routing.
 
-The script reuses one source video for simulated cameras 201-210. It runs
-stages from 1 camera up to 10 cameras. Each camera sends at a fixed cadence
-without waiting for previous responses, and each camera is routed to a Docker
-instance by a stable round-robin rule:
+The script reuses one source video for simulated cameras. Each camera sends at
+a fixed cadence without waiting for previous responses, and each camera is
+routed to a Docker instance by a stable round-robin rule:
 
     camera_index % docker_count -> port 8130 + index
 
 Example:
-    python stress_multi_docker_5fps.py --docker-count 3
+    python stress_multi_docker_5fps.py --docker-count 3 --camera-range 201-210
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence
 DEFAULT_HOST = "http://192.168.100.64"
 DEFAULT_START_PORT = 8130
 DEFAULT_VIDEO_PATH = "video/test1.mp4"
-DEFAULT_CAMERA_IDS = [str(camera_id) for camera_id in range(201, 211)]
+DEFAULT_CAMERA_RANGE = "201-210"
 DEFAULT_TARGET_FPS = 5.0
 DEFAULT_STAGE_SECONDS = 60.0
 DEFAULT_WARMUP_SECONDS = 0.0
@@ -121,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run staged 5 FPS stress tests against multiple Docker ports. "
-            "Cameras 201-210 are added from 1 route up to 10 routes."
+            "Camera IDs and camera counts are configurable."
         )
     )
     parser.add_argument("--docker-count", type=int, required=True, help="Number of Docker instances/ports to route to")
@@ -129,9 +128,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-port", type=int, default=DEFAULT_START_PORT, help="First Docker host port")
     parser.add_argument("--api-path", default="/api/v1/person/detect", help="API path")
     parser.add_argument("--video-path", default=DEFAULT_VIDEO_PATH, help="Source video reused by every camera")
+    parser.add_argument(
+        "--camera-range",
+        default=DEFAULT_CAMERA_RANGE,
+        help="Camera ID range, e.g. 201-210, 301-310, 101-110. Ignored when --camera-ids is set.",
+    )
+    parser.add_argument(
+        "--camera-ids",
+        default="",
+        help="Comma-separated camera IDs, e.g. 201,202,301. Overrides --camera-range.",
+    )
     parser.add_argument("--target-fps", type=float, default=DEFAULT_TARGET_FPS, help="Send FPS per camera")
     parser.add_argument("--start-cameras", type=int, default=1, help="First camera count")
-    parser.add_argument("--max-cameras", type=int, default=10, help="Final camera count")
+    parser.add_argument("--max-cameras", type=int, default=0, help="Final camera count, 0 means all selected camera IDs")
+    parser.add_argument("--step-cameras", type=int, default=1, help="Camera count increment per stage")
     parser.add_argument("--stage-seconds", type=float, default=DEFAULT_STAGE_SECONDS, help="Measured seconds per stage")
     parser.add_argument("--warmup-seconds", type=float, default=DEFAULT_WARMUP_SECONDS, help="Unmeasured warmup per stage")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="HTTP request timeout seconds")
@@ -191,11 +201,38 @@ def normalize_host(host: str) -> str:
     return host
 
 
-def build_routes(args: argparse.Namespace) -> Dict[str, CameraRoute]:
+def parse_camera_range(raw: str) -> List[str]:
+    value = str(raw).strip()
+    if not value:
+        raise ValueError("--camera-range cannot be empty")
+    if "-" not in value:
+        return [value]
+
+    start_raw, end_raw = value.split("-", 1)
+    start = int(start_raw.strip())
+    end = int(end_raw.strip())
+    step = 1 if end >= start else -1
+    return [str(camera_id) for camera_id in range(start, end + step, step)]
+
+
+def parse_camera_ids(args: argparse.Namespace) -> List[str]:
+    if args.camera_ids:
+        camera_ids = [item.strip() for item in args.camera_ids.split(",") if item.strip()]
+    else:
+        camera_ids = parse_camera_range(args.camera_range)
+
+    if not camera_ids:
+        raise ValueError("At least one camera ID is required")
+    if len(set(camera_ids)) != len(camera_ids):
+        raise ValueError("Camera IDs must be unique")
+    return camera_ids
+
+
+def build_routes(args: argparse.Namespace, camera_ids: Sequence[str]) -> Dict[str, CameraRoute]:
     host = normalize_host(args.host)
     api_path = args.api_path if args.api_path.startswith("/") else "/" + args.api_path
     routes: Dict[str, CameraRoute] = {}
-    for index, camera_id in enumerate(DEFAULT_CAMERA_IDS):
+    for index, camera_id in enumerate(camera_ids):
         docker_index = index % args.docker_count
         port = args.start_port + docker_index
         routes[camera_id] = CameraRoute(
@@ -378,11 +415,12 @@ def summarize_bucket(bucket: Dict[str, Any]) -> Dict[str, Any]:
 def run_stage(
     args: argparse.Namespace,
     routes: Dict[str, CameraRoute],
+    camera_ids: Sequence[str],
     frames: List[EncodedFrame],
     camera_count: int,
     jsonl_handle,
 ) -> StageMetrics:
-    active_camera_ids = DEFAULT_CAMERA_IDS[:camera_count]
+    active_camera_ids = list(camera_ids[:camera_count])
     metrics = StageMetrics(
         camera_count=camera_count,
         camera_ids=active_camera_ids,
@@ -512,16 +550,25 @@ def make_run_dir(args: argparse.Namespace) -> Path:
 
 def main() -> None:
     args = parse_args()
+    camera_ids = parse_camera_ids(args)
+    if args.max_cameras == 0:
+        args.max_cameras = len(camera_ids)
+
     if args.docker_count <= 0:
         raise ValueError("--docker-count must be positive")
     if args.target_fps <= 0:
         raise ValueError("--target-fps must be positive")
-    if args.start_cameras < 1 or args.max_cameras > len(DEFAULT_CAMERA_IDS):
-        raise ValueError("--start-cameras/--max-cameras must stay within 1..10")
+    if args.start_cameras < 1 or args.max_cameras > len(camera_ids):
+        raise ValueError(
+            f"--start-cameras/--max-cameras must stay within 1..{len(camera_ids)} "
+            f"for selected camera IDs"
+        )
     if args.start_cameras > args.max_cameras:
         raise ValueError("--start-cameras cannot be greater than --max-cameras")
+    if args.step_cameras <= 0:
+        raise ValueError("--step-cameras must be positive")
 
-    routes = build_routes(args)
+    routes = build_routes(args, camera_ids)
     video_path = Path(args.video_path)
     frames = preload_video_frames(video_path, args.target_fps, args.max_preload_frames, args.jpeg_quality)
     run_dir = make_run_dir(args)
@@ -531,8 +578,10 @@ def main() -> None:
     print(f"host={normalize_host(args.host)} start_port={args.start_port} docker_count={args.docker_count}")
     print(f"video_path={video_path} preloaded_frames={len(frames)} target_fps={args.target_fps}")
     print(f"stage_seconds={args.stage_seconds} warmup_seconds={args.warmup_seconds}")
+    print(f"camera_ids={','.join(camera_ids)}")
+    print(f"camera_count_range={args.start_cameras}..{args.max_cameras} step={args.step_cameras}")
     print("camera routing:")
-    for camera_id in DEFAULT_CAMERA_IDS:
+    for camera_id in camera_ids:
         route = routes[camera_id]
         print(f"  camera_id={camera_id} -> docker_index={route.docker_index} url={route.url}")
     print(f"run_dir={run_dir}")
@@ -540,9 +589,9 @@ def main() -> None:
     results: List[StageMetrics] = []
     jsonl_handle = records_path.open("w", encoding="utf-8") if args.save_records else None
     try:
-        for camera_count in range(args.start_cameras, args.max_cameras + 1):
+        for camera_count in range(args.start_cameras, args.max_cameras + 1, args.step_cameras):
             print(f"\nstart stage camera_count={camera_count}")
-            metrics = run_stage(args, routes, frames, camera_count, jsonl_handle)
+            metrics = run_stage(args, routes, camera_ids, frames, camera_count, jsonl_handle)
             results.append(metrics)
             print_stage(metrics)
     finally:
@@ -558,8 +607,12 @@ def main() -> None:
         "target_fps": args.target_fps,
         "stage_seconds": args.stage_seconds,
         "warmup_seconds": args.warmup_seconds,
-        "camera_ids": DEFAULT_CAMERA_IDS,
-        "routes": {camera_id: routes[camera_id].__dict__ for camera_id in DEFAULT_CAMERA_IDS},
+        "camera_ids": camera_ids,
+        "camera_range": args.camera_range,
+        "start_cameras": args.start_cameras,
+        "max_cameras": args.max_cameras,
+        "step_cameras": args.step_cameras,
+        "routes": {camera_id: routes[camera_id].__dict__ for camera_id in camera_ids},
         "stages": [metrics_to_jsonable(item) for item in results],
     }
     with summary_path.open("w", encoding="utf-8") as handle:
