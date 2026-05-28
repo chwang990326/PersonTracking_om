@@ -44,7 +44,9 @@ class FaceRecognizer:
                  architecture='ir_50',
                  similarity_threshold=0.35,
                  detection_threshold=0.5,
-                 db_path='./database/face_database'):
+                 db_path='./database/face_database',
+                 identity_cache=None,
+                 redis_memory=None):
         """
         初始化SCRFD+AdaFace人脸识别系统。
 
@@ -64,6 +66,9 @@ class FaceRecognizer:
         self.similarity_threshold = similarity_threshold
         self.detection_threshold = detection_threshold
         self.db_path = db_path
+        self.identity_cache = identity_cache
+        self.redis_memory = redis_memory
+        self.known_face_entries = []
         scrfd_model_path = resolve_model_path('weights/det_10_640.om', scrfd_model_path)
         adaface_model_path = resolve_model_path('weights/adaface_ir50_ms1mv2_b1.om', adaface_model_path)
         
@@ -146,8 +151,13 @@ class FaceRecognizer:
                     # 使用AdaFace提取人脸特征向量
                     embedding = self.recognizer.get_embedding(image, kpss[0])
                     
-                    # 将特征向量添加到FAISS数据库
+                    # 将特征向量添加到本地 fallback 数据库，并保留可发布到 Redis 的条目。
                     self.face_db.add_face(embedding, person_id)
+                    self.known_face_entries.append({
+                        "person_id": str(person_id),
+                        "embedding": embedding.copy(),
+                        "filename": img_file,
+                    })
                     loaded_count += 1
                     
                 except Exception as e:
@@ -155,6 +165,25 @@ class FaceRecognizer:
                     continue
 
         print(f"[FaceRecognizer] 成功加载 {loaded_count} 个人脸特征")
+
+    def export_known_face_entries(self):
+        """Return known face embeddings extracted from faceImage."""
+        return [
+            {
+                "person_id": entry["person_id"],
+                "embedding": entry["embedding"].copy(),
+                "filename": entry.get("filename", ""),
+            }
+            for entry in self.known_face_entries
+        ]
+
+    def search_known_face(self, embedding, threshold=None):
+        threshold = self.similarity_threshold if threshold is None else threshold
+        if self.identity_cache is not None:
+            person_id, similarity = self.identity_cache.search_known_face(embedding, threshold)
+            if person_id is not None:
+                return str(person_id), similarity
+        return self.face_db.search(embedding, threshold)
 
     def detect_and_recognize(self, face_detector, frame, person_crop, crop_x1, crop_y1):
         """
@@ -188,8 +217,8 @@ class FaceRecognizer:
                     # 使用AdaFace提取人脸特征向量
                     embedding = self.recognizer.get_embedding(person_crop, kps)
                     
-                    # 在FAISS数据库中搜索最匹配的已知人脸
-                    person_id, similarity = self.face_db.search(embedding, self.similarity_threshold)
+                    # 优先查 worker 本地身份索引，fallback 到 FaceDatabase。
+                    person_id, similarity = self.search_known_face(embedding, self.similarity_threshold)
                     face_ids.append(person_id)
                     
                     # 将相对坐标转换为全局坐标
@@ -249,5 +278,6 @@ class FaceRecognizer:
     def reload_gallery(self):
         """重新加载人脸库"""
         self.face_db = FaceDatabase(db_path=self.db_path)
+        self.known_face_entries = []
         self._load_face_gallery()
         print("[FaceRecognizer] 人脸库已重新加载")
