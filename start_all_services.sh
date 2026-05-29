@@ -33,7 +33,7 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/home/wangchenhao/PersonTracking_om}"
 
 # 算法镜像名。
-IMAGE_NAME="${IMAGE_NAME:-person_tracking_om:v1}"
+IMAGE_NAME="${IMAGE_NAME:-person_tracking_full:v2}"
 
 # 要启用的 NPU 卡号，逗号分隔。
 NPU_DEVICES="${NPU_DEVICES:-0,1}"
