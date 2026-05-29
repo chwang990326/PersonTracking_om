@@ -305,6 +305,11 @@ start_algorithm_container() {
     -v "${FACE_IMAGE_MOUNT}:/app/faceImage"
     -w /app
     -e "ASCEND_DEVICE_ID=${device}"
+    -e "REDIS_HOST=${HOST_GATEWAY_NAME}"
+    -e "REDIS_PORT=${REDIS_HOST_PORT}"
+    -e "REDIS_DB=${REDIS_DB}"
+    -e "REDIS_PASSWORD=${REDIS_PASSWORD}"
+    -e "REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX}"
   )
 
   if [[ "$ENABLE_PROFILING" == "1" ]]; then
@@ -325,11 +330,6 @@ start_algorithm_container() {
       -p "${GATEWAY_PORT}:${GATEWAY_PORT}"
       -e "GATEWAY_CONFIG=/app/config/gateway_pipelines.json"
       -e "GATEWAY_PORT=${GATEWAY_PORT}"
-      -e "REDIS_HOST=${HOST_GATEWAY_NAME}"
-      -e "REDIS_PORT=${REDIS_HOST_PORT}"
-      -e "REDIS_DB=${REDIS_DB}"
-      -e "REDIS_PASSWORD=${REDIS_PASSWORD}"
-      -e "REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX}"
     )
     inner_cmd+="uvicorn gateway_server:app --host 0.0.0.0 --port ${GATEWAY_PORT} --workers 1 & "
   fi
