@@ -59,6 +59,11 @@ def _env_float(name: str, default: float) -> float:
     return float(value) if value else default
 
 
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value if value else default
+
+
 def parse_pipelines(raw: str) -> Dict[str, str]:
     """
     Parse GATEWAY_PIPELINES.
@@ -157,11 +162,11 @@ def load_pipelines() -> tuple[Dict[str, str], str]:
 class GatewaySettings:
     def __init__(self) -> None:
         self.pipelines, self.pipeline_source = load_pipelines()
-        self.redis_host = DEFAULT_REDIS_HOST
-        self.redis_port = DEFAULT_REDIS_PORT
-        self.redis_db = DEFAULT_REDIS_DB
-        self.redis_password = DEFAULT_REDIS_PASSWORD
-        self.redis_key_prefix = DEFAULT_REDIS_KEY_PREFIX
+        self.redis_host = _env_str("REDIS_HOST", DEFAULT_REDIS_HOST)
+        self.redis_port = _env_int("REDIS_PORT", DEFAULT_REDIS_PORT)
+        self.redis_db = _env_int("REDIS_DB", DEFAULT_REDIS_DB)
+        self.redis_password = _env_str("REDIS_PASSWORD", DEFAULT_REDIS_PASSWORD)
+        self.redis_key_prefix = _env_str("REDIS_KEY_PREFIX", DEFAULT_REDIS_KEY_PREFIX)
         self.gateway_key_prefix = "gateway"
         self.camera_route_ttl_seconds = DEFAULT_CAMERA_ROUTE_TTL_SECONDS
         self.lock_ttl_ms = _env_int("GATEWAY_ROUTE_LOCK_TTL_MS", 5000)

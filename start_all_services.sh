@@ -55,12 +55,12 @@ REDIS_CONTAINER="${REDIS_CONTAINER:-gateway-redis}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:8.0-alpine}"
 REDIS_HOST_PORT="${REDIS_HOST_PORT:-6380}"
 REDIS_PASSWORD="${REDIS_PASSWORD:-redis2ForPersonTracking}"
+HOST_GATEWAY_NAME="${HOST_GATEWAY_NAME:-host.docker.internal}"
 
 # Gateway 配置文件由本脚本自动生成，Gateway 启动时读取它。
 GATEWAY_CONFIG="${GATEWAY_CONFIG:-${PROJECT_DIR}/config/gateway_pipelines.json}"
 
 # Gateway 日志和 pid 文件。
-GATEWAY_LOG="${GATEWAY_LOG:-${PROJECT_DIR}/gateway.log}"
 GATEWAY_PID_FILE="${GATEWAY_PID_FILE:-${PROJECT_DIR}/gateway.pid}"
 
 # 等待后端/Gateway 启动成功的最长秒数。
@@ -80,8 +80,6 @@ ENABLE_PROFILING="${ENABLE_PROFILING:-0}"
 PROFILE_LOG_EVERY="${PROFILE_LOG_EVERY:-100}"
 
 # 启动 Gateway 使用的 Python 命令。如果在 conda 环境里运行脚本，默认 python 即可。
-PYTHON_BIN="${PYTHON_BIN:-python}"
-
 # 统一使用 sudo docker。
 DOCKER=(sudo docker)
 
@@ -253,7 +251,7 @@ generate_gateway_config() {
         first=0
         printf '    {\n'
         printf '      "id": "%s",\n' "$pipe_id"
-        printf '      "url": "http://127.0.0.1:%s"\n' "$port"
+        printf '      "url": "http://%s:%s"\n' "$HOST_GATEWAY_NAME" "$port"
         printf '    }'
       done
     done
@@ -289,6 +287,7 @@ start_algorithm_container() {
     run -d
     --name "$name"
     --restart=always
+    --add-host "${HOST_GATEWAY_NAME}:host-gateway"
     --privileged
     --device "/dev/davinci${device}"
     --device /dev/davinci_manager
@@ -318,6 +317,19 @@ start_algorithm_container() {
     docker_args+=(-p "${port}:${port}")
     inner_cmd+="uvicorn api_server:app --host 0.0.0.0 --port ${port} --workers 1 & "
   done
+
+  if [[ "$device_index" -eq 0 ]]; then
+    docker_args+=(
+      -p "${GATEWAY_PORT}:${GATEWAY_PORT}"
+      -e "GATEWAY_CONFIG=/app/config/gateway_pipelines.json"
+      -e "GATEWAY_PORT=${GATEWAY_PORT}"
+      -e "REDIS_HOST=${HOST_GATEWAY_NAME}"
+      -e "REDIS_PORT=${REDIS_HOST_PORT}"
+      -e "REDIS_PASSWORD=${REDIS_PASSWORD}"
+    )
+    inner_cmd+="uvicorn gateway_server:app --host 0.0.0.0 --port ${GATEWAY_PORT} --workers 1 & "
+  fi
+
   inner_cmd+="wait"
 
   docker_args+=("$IMAGE_NAME" bash -lc "$inner_cmd")
@@ -338,26 +350,6 @@ wait_algorithm_ports() {
 }
 
 # 启动 Gateway，并让它读取本脚本生成的 GATEWAY_CONFIG。
-start_gateway() {
-  stop_existing_gateway
-
-  log "starting gateway on port ${GATEWAY_PORT}"
-  (
-    cd "$PROJECT_DIR"
-    export GATEWAY_CONFIG="$GATEWAY_CONFIG"
-    export no_proxy="127.0.0.1,localhost,${no_proxy:-}"
-    export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-}"
-    nohup "$PYTHON_BIN" -m uvicorn gateway_server:app \
-      --host 0.0.0.0 \
-      --port "$GATEWAY_PORT" \
-      --workers 1 \
-      > "$GATEWAY_LOG" 2>&1 &
-    printf '%s' "$!" > "$GATEWAY_PID_FILE"
-  )
-
-  wait_url "http://127.0.0.1:${GATEWAY_PORT}/health" "gateway"
-}
-
 main() {
   if [[ "$WORKERS_PER_DOCKER" -le 0 ]]; then
     log "ERROR: WORKERS_PER_DOCKER must be positive"
@@ -380,6 +372,7 @@ main() {
 
   start_redis
   generate_gateway_config
+  stop_existing_gateway
   stop_existing_algorithm_containers
 
   local device_index
@@ -388,7 +381,7 @@ main() {
   done
 
   wait_algorithm_ports
-  start_gateway
+  wait_url "http://127.0.0.1:${GATEWAY_PORT}/health" "gateway"
 
   log "all services started"
   log "gateway: http://127.0.0.1:${GATEWAY_PORT}/health"
