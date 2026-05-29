@@ -73,7 +73,7 @@ APP_MOUNT="${APP_MOUNT:-${PROJECT_DIR}}"
 
 # 挂载到算法 Docker /app/faceImage 的宿主机人脸库目录。
 # 会放在 -v ${APP_MOUNT}:/app 后面，确保覆盖 /app/faceImage。
-FACE_IMAGE_MOUNT="${FACE_IMAGE_MOUNT:-/data/faceImage}"
+FACE_IMAGE_MOUNT="${FACE_IMAGE_MOUNT:-/home/wangchenhao/PersonTracking_om/faceImage}"
 
 # 性能耗时统计默认关闭。
 # 启动时设置 ENABLE_PROFILING=1 才会传入算法 Docker。
