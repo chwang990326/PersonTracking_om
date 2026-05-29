@@ -30,7 +30,7 @@ set -euo pipefail
 #   npu1_worker2 -> 8136
 
 # 项目目录。服务器上代码挂载/运行的根目录。
-PROJECT_DIR="${PROJECT_DIR:-/home/wangchenhao/PersonTracking_om_test}"
+PROJECT_DIR="${PROJECT_DIR:-/home/wangchenhao/PersonTracking_om}"
 
 # 算法镜像名。
 IMAGE_NAME="${IMAGE_NAME:-person_tracking_om:v1}"
