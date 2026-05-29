@@ -183,7 +183,7 @@ class CameraRouteStore:
     def __init__(self, client: redis.Redis, settings: GatewaySettings) -> None:
         self.client = client
         self.settings = settings
-        self.pipeline_ids = sorted(settings.pipelines.keys())
+        self.pipeline_ids = list(settings.pipelines.keys())
 
     def _key(self, name: str) -> str:
         parts = [
@@ -292,11 +292,16 @@ class CameraRouteStore:
 
     async def choose_pipeline(self) -> str:
         await self.cleanup_stale_routes()
-        counts = []
+        best_pipe_id = None
+        best_count = None
         for pipe_id in self.pipeline_ids:
             count = await self.client.scard(self.pipeline_cameras_key(pipe_id))
-            counts.append((count, pipe_id))
-        return min(counts)[1]
+            if best_count is None or count < best_count:
+                best_count = count
+                best_pipe_id = pipe_id
+        if best_pipe_id is None:
+            raise HTTPException(status_code=503, detail="No pipelines configured")
+        return best_pipe_id
 
     async def cleanup_stale_routes(self) -> int:
         removed = 0

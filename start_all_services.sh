@@ -242,9 +242,9 @@ generate_gateway_config() {
     printf '  "pipelines": [\n'
     local first=1
     local device_index worker_index device port pipe_id
-    for device_index in "${!DEVICES[@]}"; do
-      device="${DEVICES[$device_index]}"
-      for ((worker_index = 0; worker_index < WORKERS_PER_DOCKER; worker_index++)); do
+    for ((worker_index = 0; worker_index < WORKERS_PER_DOCKER; worker_index++)); do
+      for device_index in "${!DEVICES[@]}"; do
+        device="${DEVICES[$device_index]}"
         port="$(port_for_worker "$device_index" "$worker_index" "${#DEVICES[@]}")"
         pipe_id="npu${device}_worker${worker_index}"
         if [[ "$first" -eq 0 ]]; then
