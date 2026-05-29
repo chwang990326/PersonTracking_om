@@ -19,10 +19,10 @@ DEFAULT_GATEWAY_CONFIG = "config/gateway_pipelines.json"
 DEFAULT_PIPELINES = "npu0_pipe1=http://127.0.0.1:8131,npu1_pipe1=http://127.0.0.1:8132"
 
 DEFAULT_REDIS_HOST = "127.0.0.1"
-DEFAULT_REDIS_PORT = 6380
-DEFAULT_REDIS_PASSWORD = "redis2ForPersonTracking"
-DEFAULT_REDIS_DB = 0
-DEFAULT_REDIS_KEY_PREFIX = "person_tracking"
+DEFAULT_REDIS_PORT = 6379
+DEFAULT_REDIS_PASSWORD = "redisForPersonTracking"
+DEFAULT_REDIS_DB = 1
+DEFAULT_REDIS_KEY_PREFIX = "gateway"
 DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT = 2
 DEFAULT_REDIS_SOCKET_TIMEOUT = 2
 DEFAULT_CAMERA_ROUTE_TTL_SECONDS = 300
@@ -167,7 +167,7 @@ class GatewaySettings:
         self.redis_db = _env_int("REDIS_DB", DEFAULT_REDIS_DB)
         self.redis_password = _env_str("REDIS_PASSWORD", DEFAULT_REDIS_PASSWORD)
         self.redis_key_prefix = _env_str("REDIS_KEY_PREFIX", DEFAULT_REDIS_KEY_PREFIX)
-        self.gateway_key_prefix = "gateway"
+        self.gateway_key_prefix = ""
         self.camera_route_ttl_seconds = DEFAULT_CAMERA_ROUTE_TTL_SECONDS
         self.lock_ttl_ms = _env_int("GATEWAY_ROUTE_LOCK_TTL_MS", 5000)
         self.lock_retry_sleep_ms = _env_int("GATEWAY_ROUTE_LOCK_RETRY_SLEEP_MS", 50)
@@ -186,11 +186,12 @@ class CameraRouteStore:
         self.pipeline_ids = sorted(settings.pipelines.keys())
 
     def _key(self, name: str) -> str:
-        return (
-            f"{self.settings.redis_key_prefix}:"
-            f"{self.settings.gateway_key_prefix}:"
-            f"{name}"
-        )
+        parts = [
+            self.settings.redis_key_prefix,
+            self.settings.gateway_key_prefix,
+            name,
+        ]
+        return ":".join(part for part in parts if part)
 
     def route_key(self, camera_id: str) -> str:
         return self._key(f"camera_route:{camera_id}")

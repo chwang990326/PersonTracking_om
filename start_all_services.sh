@@ -53,8 +53,10 @@ CONTAINER_PREFIX="${CONTAINER_PREFIX:-person_tracking_om_d}"
 # Redis 容器配置。Redis 用于保存 camera_id -> pipeline 的路由关系。
 REDIS_CONTAINER="${REDIS_CONTAINER:-gateway-redis}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:8.0-alpine}"
-REDIS_HOST_PORT="${REDIS_HOST_PORT:-6380}"
-REDIS_PASSWORD="${REDIS_PASSWORD:-redis2ForPersonTracking}"
+REDIS_HOST_PORT="${REDIS_HOST_PORT:-6379}"
+REDIS_PASSWORD="${REDIS_PASSWORD:-redisForPersonTracking}"
+REDIS_DB="${REDIS_DB:-1}"
+REDIS_KEY_PREFIX="${REDIS_KEY_PREFIX:-gateway}"
 HOST_GATEWAY_NAME="${HOST_GATEWAY_NAME:-host.docker.internal}"
 
 # Gateway 配置文件由本脚本自动生成，Gateway 启动时读取它。
@@ -325,7 +327,9 @@ start_algorithm_container() {
       -e "GATEWAY_PORT=${GATEWAY_PORT}"
       -e "REDIS_HOST=${HOST_GATEWAY_NAME}"
       -e "REDIS_PORT=${REDIS_HOST_PORT}"
+      -e "REDIS_DB=${REDIS_DB}"
       -e "REDIS_PASSWORD=${REDIS_PASSWORD}"
+      -e "REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX}"
     )
     inner_cmd+="uvicorn gateway_server:app --host 0.0.0.0 --port ${GATEWAY_PORT} --workers 1 & "
   fi

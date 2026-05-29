@@ -136,16 +136,16 @@ stop_algorithm_containers() {
   done
 }
 
-# 默认保留 Redis；只有 STOP_REDIS=1 时才停止。
+# 默认保留 Redis；只有 STOP_REDIS=1 时才删除 Redis 容器。
 stop_redis_if_requested() {
   if [[ "$STOP_REDIS" != "1" ]]; then
-    log "redis left running; set STOP_REDIS=1 to stop ${REDIS_CONTAINER}"
+    log "redis left running; set STOP_REDIS=1 to remove ${REDIS_CONTAINER}"
     return
   fi
 
   if container_exists "$REDIS_CONTAINER"; then
-    log "stopping redis container: $REDIS_CONTAINER"
-    "${DOCKER[@]}" stop "$REDIS_CONTAINER" >/dev/null || true
+    log "removing redis container: $REDIS_CONTAINER"
+    "${DOCKER[@]}" rm -f "$REDIS_CONTAINER" >/dev/null || true
   else
     log "redis container not found: $REDIS_CONTAINER"
   fi
